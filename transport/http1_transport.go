@@ -156,13 +156,15 @@ func (t *HTTP1Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Try to get an idle connection
 	conn, err := t.getIdleConn(key)
 	if err == nil && conn != nil {
-		// Use a short deadline for pooled connections to detect dead tunnels
-		// quickly (e.g. proxy silently dropped upstream). If it fails, we
-		// fall through to a fresh connection with the full timeout budget.
-		pooledDeadline := time.Now().Add(3 * time.Second)
-		conn.conn.SetDeadline(pooledDeadline)
+		// Use a sub-context with a short timeout to detect dead pooled tunnels
+		// quickly (e.g. proxy silently dropped upstream). doRequest reads the
+		// deadline from req.Context(), so we must pass a context-derived timeout
+		// rather than calling SetDeadline directly (doRequest would overwrite it).
+		poolCtx, poolCancel := context.WithTimeout(req.Context(), 3*time.Second)
+		poolReq := req.WithContext(poolCtx)
 
-		resp, err := t.doRequest(conn, req)
+		resp, err := t.doRequest(conn, poolReq)
+		poolCancel()
 		if err == nil {
 			// Success — reset deadline for body reads to use the full budget
 			if ctxDeadline, ok := req.Context().Deadline(); ok {
