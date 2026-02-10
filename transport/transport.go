@@ -718,35 +718,22 @@ func (t *Transport) Do(ctx context.Context, req *Request) (*Response, error) {
 			return t.doHTTP3(ctx, req)
 
 		case ProtocolAuto:
-			// Auto-select based on proxy capabilities
-			if t.h3ProxyError != nil {
-				// H3 proxy failed during init - use H2/H1 only
-				resp, err := t.doHTTP2(ctx, req)
-				if err == nil {
-					return resp, nil
-				}
-				return t.doHTTP1(ctx, req)
-			}
-
-			if SupportsQUIC(effectiveProxyURL) {
-				// SOCKS5 or MASQUE proxy - prefer HTTP/3 for best fingerprinting
+			// For QUIC-capable proxies (SOCKS5/MASQUE), try H3 first
+			if t.h3ProxyError == nil && SupportsQUIC(effectiveProxyURL) {
+				host := extractHost(req.URL)
 				resp, err := t.doHTTP3(ctx, req)
 				if err == nil {
+					t.protocolSupportMu.Lock()
+					t.protocolSupport[host] = ProtocolHTTP3
+					t.protocolSupportMu.Unlock()
 					return resp, nil
 				}
-				// Fallback to HTTP/2 if HTTP/3 fails
-				resp, err = t.doHTTP2(ctx, req)
-				if err == nil {
-					return resp, nil
-				}
-				return t.doHTTP1(ctx, req)
+				// H3 failed, fall through to H2/H1
 			}
-			// HTTP proxy - only supports H2/H1
-			resp, err := t.doHTTP2(ctx, req)
-			if err == nil {
-				return resp, nil
-			}
-			return t.doHTTP1(ctx, req)
+			// Delegate to doAuto() for H2/H1 with protocol caching.
+			// doAuto() skips the H3 race when proxy is set, and caches
+			// the working protocol so subsequent requests skip the probe.
+			return t.doAuto(ctx, req)
 
 		default:
 			return t.doHTTP2(ctx, req)

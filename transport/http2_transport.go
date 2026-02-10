@@ -615,6 +615,13 @@ func (c *persistentConn) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Close the HTTP/2 client connection first — this sends a GOAWAY frame
+	// and terminates the internal readLoop goroutine. Without this, the
+	// readLoop blocks for ~60s waiting for the dead TCP connection to time out.
+	if c.h2Conn != nil {
+		closeWithTimeout(c.h2Conn, 3*time.Second)
+	}
+
 	if c.tlsConn != nil {
 		c.tlsConn.Close()
 	}
