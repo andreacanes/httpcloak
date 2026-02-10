@@ -339,10 +339,11 @@ func NewTransportWithConfig(presetName string, proxy *ProxyConfig, config *Trans
 				t.h3Transport = h3Transport
 			}
 		} else {
-			// HTTP proxy - HTTP/3 doesn't work through HTTP proxies
-			// Store error so H3 requests fail explicitly
+			// HTTP proxy - HTTP/3 doesn't work through HTTP proxies.
+			// Don't create H3 transport — its constructor opens a UDP socket and
+			// creates QUIC infrastructure that lingers ~60s on Close() even when
+			// never used, because quic-go waits for graceful drain.
 			t.h3ProxyError = fmt.Errorf("HTTP proxy does not support HTTP/3 (QUIC requires UDP)")
-			t.h3Transport = NewHTTP3TransportWithTransportConfig(preset, dnsCache, config)
 		}
 	} else {
 		// No proxy - HTTP/3 works directly
@@ -377,7 +378,10 @@ func (t *Transport) SetProxy(proxy *ProxyConfig) {
 	// Close existing transports
 	t.h1Transport.Close()
 	t.h2Transport.Close()
-	t.h3Transport.Close()
+	if t.h3Transport != nil {
+		t.h3Transport.Close()
+		t.h3Transport = nil
+	}
 
 	// Recreate HTTP/1.1 and HTTP/2 with new proxy config
 	t.h1Transport = NewHTTP1TransportWithProxy(t.preset, t.dnsCache, proxy)
@@ -413,12 +417,13 @@ func (t *Transport) SetProxy(proxy *ProxyConfig) {
 			} else {
 				t.h3Transport = h3Transport
 			}
-		} else {
-			t.h3Transport = NewHTTP3Transport(t.preset, t.dnsCache)
 		}
-	} else {
+		// else: HTTP proxy — don't create H3 transport (QUIC can't traverse HTTP proxies)
+	} else if proxy == nil {
+		// No proxy - HTTP/3 works directly
 		t.h3Transport = NewHTTP3Transport(t.preset, t.dnsCache)
 	}
+	// else: proxy set but no UDP URL — don't create H3
 }
 
 // SetPreset changes the fingerprint preset
@@ -428,7 +433,10 @@ func (t *Transport) SetPreset(presetName string) {
 	// Close all transports
 	t.h1Transport.Close()
 	t.h2Transport.Close()
-	t.h3Transport.Close()
+	if t.h3Transport != nil {
+		t.h3Transport.Close()
+		t.h3Transport = nil
+	}
 
 	// Recreate HTTP/1.1 and HTTP/2 with new preset
 	t.h1Transport = NewHTTP1TransportWithProxy(t.preset, t.dnsCache, t.proxy)
@@ -450,10 +458,10 @@ func (t *Transport) SetPreset(presetName string) {
 			} else {
 				t.h3Transport = h3Transport
 			}
-		} else {
-			t.h3Transport = NewHTTP3Transport(t.preset, t.dnsCache)
 		}
+		// else: HTTP proxy — don't create H3 transport
 	} else {
+		// No proxy - HTTP/3 works directly
 		t.h3Transport = NewHTTP3Transport(t.preset, t.dnsCache)
 	}
 }
@@ -1487,7 +1495,9 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 func (t *Transport) Close() {
 	t.h1Transport.Close()
 	t.h2Transport.Close()
-	t.h3Transport.Close()
+	if t.h3Transport != nil {
+		t.h3Transport.Close()
+	}
 }
 
 // Refresh closes all connections but keeps TLS session caches intact.
@@ -1496,16 +1506,21 @@ func (t *Transport) Close() {
 func (t *Transport) Refresh() {
 	t.h1Transport.Refresh()
 	t.h2Transport.Refresh()
-	t.h3Transport.Refresh()
+	if t.h3Transport != nil {
+		t.h3Transport.Refresh()
+	}
 }
 
 // Stats returns transport statistics
 func (t *Transport) Stats() map[string]interface{} {
-	return map[string]interface{}{
+	stats := map[string]interface{}{
 		"http1": t.h1Transport.Stats(),
 		"http2": t.h2Transport.Stats(),
-		"http3": t.h3Transport.Stats(),
 	}
+	if t.h3Transport != nil {
+		stats["http3"] = t.h3Transport.Stats()
+	}
+	return stats
 }
 
 // GetDNSCache returns the DNS cache
