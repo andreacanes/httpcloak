@@ -218,16 +218,13 @@ func (t *HTTP2Transport) isConnUsable(conn *persistentConn) bool {
 		return false
 	}
 
-	// Just check if connection object exists - we'll handle errors during RoundTrip
+	// Just check if connection object exists - we'll handle errors during RoundTrip.
+	// NOTE: We intentionally do NOT check CanTakeNewRequest() here because it can
+	// return false even when the connection is fine (e.g. during SETTINGS exchange,
+	// transient stream count at max, proxy tunnel hiccups triggering premature GOAWAY).
+	// Through HTTP proxies this causes a connection churn cascade that breaks requests.
+	// Errors during actual RoundTrip() will trigger connection removal and retry.
 	if conn.h2Conn == nil {
-		return false
-	}
-
-	// Check if H2 connection can still accept requests.
-	// Detects GOAWAY, dead connections from proxy tunnel closures
-	// (e.g. after server sends Connection: close to MITM proxy),
-	// and exhausted stream limits.
-	if !conn.h2Conn.CanTakeNewRequest() {
 		return false
 	}
 
@@ -617,14 +614,6 @@ func (t *HTTP2Transport) removeConn(key string) {
 func (c *persistentConn) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	// Close H2 client connection first — sends GOAWAY and stops the
-	// internal read loop goroutine.  Without this the goroutine blocks
-	// on conn.Read() until the TCP idle timeout (~60s), keeping the
-	// Go runtime alive and causing visible process-exit linger.
-	if c.h2Conn != nil {
-		closeWithTimeout(c.h2Conn, 3*time.Second)
-	}
 
 	if c.tlsConn != nil {
 		c.tlsConn.Close()
