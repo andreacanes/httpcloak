@@ -195,6 +195,13 @@ func (t *HTTP1Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		// Connection failed, close it and try new one
 		conn.close()
+		// Reset body reader: writeRequest consumed it via io.Copy during
+		// the failed probe. poolReq shares the same Body (WithContext is a
+		// shallow copy), so req.Body is exhausted too. GetBody returns a
+		// fresh reader from the original bytes.
+		if req.GetBody != nil {
+			req.Body, _ = req.GetBody()
+		}
 	}
 
 	// Create new connection (pass request host for SNI, connectHost used internally for DNS)
@@ -994,7 +1001,16 @@ func (t *HTTP1Transport) writeHeadersInOrder(w *bufio.Writer, req *http.Request,
 
 // shouldKeepAlive determines if connection should be reused
 func (t *HTTP1Transport) shouldKeepAlive(req *http.Request, resp *http.Response) bool {
-	// Check response Connection header
+	// resp.Close is the canonical signal from Go's readTransfer():
+	// it is set to true when the response contains "Connection: close",
+	// and readTransfer REMOVES the Connection header from resp.Header
+	// afterwards. So we must check resp.Close first — the header will
+	// already be gone by the time we get here.
+	if resp.Close {
+		return false
+	}
+
+	// Check response Connection header (fallback for non-standard parsers)
 	if resp.Header.Get("Connection") == "close" {
 		return false
 	}
