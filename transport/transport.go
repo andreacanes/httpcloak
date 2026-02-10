@@ -791,8 +791,11 @@ func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error)
 		}
 	}
 
-	// Race HTTP/3 and HTTP/2 in parallel if H3 is supported
-	if t.preset.SupportHTTP3 {
+	// Race HTTP/3 and HTTP/2 in parallel if H3 is supported.
+	// Skip H3 race when a proxy is configured — QUIC cannot traverse HTTP CONNECT
+	// proxies, so the H3 leg always fails but spawns goroutines that linger ~60s
+	// waiting for QUIC graceful drain.
+	if t.preset.SupportHTTP3 && t.proxy == nil {
 		resp, protocol, err := t.raceH3H2(ctx, req)
 		if err == nil {
 			t.protocolSupportMu.Lock()
