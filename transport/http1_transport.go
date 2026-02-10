@@ -594,8 +594,11 @@ func (t *HTTP1Transport) doRequest(conn *http1Conn, req *http.Request) (*http.Re
 	conn.lastUsedAt = time.Now()
 	conn.useCount++
 
-	// Set deadline
+	// Set deadline — use the earlier of responseTimeout and the request context
 	deadline := time.Now().Add(t.responseTimeout)
+	if ctxDeadline, ok := req.Context().Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
 	conn.conn.SetDeadline(deadline)
 	defer conn.conn.SetDeadline(time.Time{})
 
