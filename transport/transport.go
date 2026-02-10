@@ -779,8 +779,14 @@ func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error)
 			if errors.As(err, &alpnErr) {
 				return t.doHTTP1WithTLSConn(ctx, req, alpnErr)
 			}
-			// H2 failed for other reason, try H1 with new connection
-			return t.doHTTP1(ctx, req)
+			// H2 failed — downgrade cache to H1 for future requests.
+			// Do NOT retry with doHTTP1 here: the H2 attempt may have already
+			// sent the request on the wire, and resending (especially POST)
+			// would cause a duplicate request visible to the server.
+			t.protocolSupportMu.Lock()
+			t.protocolSupport[host] = ProtocolHTTP1
+			t.protocolSupportMu.Unlock()
+			return nil, err
 		case ProtocolHTTP1:
 			return t.doHTTP1(ctx, req)
 		}
