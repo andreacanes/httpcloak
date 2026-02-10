@@ -901,6 +901,12 @@ func (c *http1Conn) close() {
 	}
 	c.closed = true
 
+	// Set a short deadline so Close() doesn't block waiting for the
+	// remote end (through a proxy) to ACK the TCP FIN / TLS close_notify.
+	if c.conn != nil {
+		c.conn.SetDeadline(time.Now().Add(3 * time.Second))
+	}
+
 	if c.tlsConn != nil {
 		c.tlsConn.Close()
 	} else if c.conn != nil {

@@ -618,6 +618,14 @@ func (c *persistentConn) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Close H2 client connection first — sends GOAWAY and stops the
+	// internal read loop goroutine.  Without this the goroutine blocks
+	// on conn.Read() until the TCP idle timeout (~60s), keeping the
+	// Go runtime alive and causing visible process-exit linger.
+	if c.h2Conn != nil {
+		closeWithTimeout(c.h2Conn, 3*time.Second)
+	}
+
 	if c.tlsConn != nil {
 		c.tlsConn.Close()
 	}
