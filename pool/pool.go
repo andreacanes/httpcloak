@@ -11,8 +11,11 @@ import (
 	"sync"
 	"time"
 
+	"io"
+
 	"github.com/sardanioss/httpcloak/dns"
 	"github.com/sardanioss/httpcloak/fingerprint"
+	"github.com/sardanioss/httpcloak/transport"
 	"github.com/sardanioss/net/http2"
 	"github.com/sardanioss/net/http2/hpack"
 	tls "github.com/sardanioss/utls"
@@ -102,7 +105,8 @@ func (c *Conn) Close() error {
 
 // HostPool manages connections to a single host
 type HostPool struct {
-	host        string
+	host        string // Connection host (for DNS resolution - may be connectTo target)
+	sniHost     string // SNI host (for TLS ServerName - always the original request host)
 	port        string
 	preset      *fingerprint.Preset
 	dnsCache    *dns.Cache
@@ -129,6 +133,7 @@ type HostPool struct {
 	connectTimeout     time.Duration
 	insecureSkipVerify bool
 	proxyURL           string
+	localAddr          string // Local IP to bind outgoing connections
 
 	// ECH (Encrypted Client Hello) configuration
 	echConfig       []byte // Custom ECH configuration
@@ -154,17 +159,24 @@ func NewHostPool(host, port string, preset *fingerprint.Preset, dnsCache *dns.Ca
 			cachedPSKSpec = &spec
 		}
 	}
-	return NewHostPoolWithConfig(host, port, preset, dnsCache, false, "", cachedSpec, cachedPSKSpec, shuffleSeed, nil)
+	return NewHostPoolWithConfig(host, "", port, preset, dnsCache, false, "", cachedSpec, cachedPSKSpec, shuffleSeed, nil)
 }
 
 // NewHostPoolWithConfig creates a pool with TLS and proxy configuration
-func NewHostPoolWithConfig(host, port string, preset *fingerprint.Preset, dnsCache *dns.Cache, insecureSkipVerify bool, proxyURL string, cachedSpec, cachedPSKSpec *utls.ClientHelloSpec, shuffleSeed int64, sessionCache utls.ClientSessionCache) *HostPool {
+// host is the connection host (for DNS resolution, may be connectTo target)
+// sniHost is the TLS ServerName host (original request host, used for SNI)
+// If sniHost is empty, host is used for both DNS and SNI
+func NewHostPoolWithConfig(host, sniHost, port string, preset *fingerprint.Preset, dnsCache *dns.Cache, insecureSkipVerify bool, proxyURL string, cachedSpec, cachedPSKSpec *utls.ClientHelloSpec, shuffleSeed int64, sessionCache utls.ClientSessionCache) *HostPool {
 	// Use provided session cache or create a new one for backward compatibility
 	if sessionCache == nil {
 		sessionCache = utls.NewLRUClientSessionCache(32)
 	}
+	if sniHost == "" {
+		sniHost = host
+	}
 	pool := &HostPool{
 		host:               host,
+		sniHost:            sniHost,
 		port:               port,
 		preset:             preset,
 		dnsCache:           dnsCache,
@@ -203,6 +215,13 @@ func (p *HostPool) SetECHConfigDomain(domain string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.echConfigDomain = domain
+}
+
+// SetLocalAddr sets the local IP address for outgoing connections
+func (p *HostPool) SetLocalAddr(addr string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.localAddr = addr
 }
 
 // GetConn returns an available connection or creates a new one
@@ -309,10 +328,14 @@ func (p *HostPool) createConn(ctx context.Context) (*Conn, error) {
 		minVersion = tls.VersionTLS13
 	}
 
+	// Get key log writer from global setting
+	var keyLogWriter io.Writer = transport.GetKeyLogWriter()
+
 	// Wrap with uTLS for fingerprinting
 	// Enable session tickets for PSK resumption (Chrome does this)
+	// Use sniHost (original request host) for TLS ServerName, not p.host (which may be connectTo target)
 	tlsConfig := &utls.Config{
-		ServerName:                     p.host,
+		ServerName:                     p.sniHost,
 		InsecureSkipVerify:             p.insecureSkipVerify,
 		MinVersion:                     minVersion,
 		MaxVersion:                     tls.VersionTLS13,
@@ -320,6 +343,7 @@ func (p *HostPool) createConn(ctx context.Context) (*Conn, error) {
 		ClientSessionCache:             p.sessionCache, // Use per-host session cache
 		OmitEmptyPsk:                   true,           // Chrome doesn't send empty PSK on first connection
 		EncryptedClientHelloConfigList: echConfigList,  // ECH configuration (if available)
+		KeyLogWriter:                   keyLogWriter,
 	}
 
 	// Generate fresh spec for this connection to avoid race condition
@@ -438,6 +462,26 @@ func (p *HostPool) createConn(ctx context.Context) (*Conn, error) {
 // dialHappyEyeballs implements RFC 8305 Happy Eyeballs v2
 // Starts preferred IPs first, waits 250ms, then starts fallback IPs
 func (p *HostPool) dialHappyEyeballs(ctx context.Context, preferredIPs, fallbackIPs []net.IP) (net.Conn, error) {
+	// Filter IPs by local address family if set
+	if p.localAddr != "" {
+		localIP := net.ParseIP(p.localAddr)
+		if localIP != nil {
+			isLocalIPv6 := localIP.To4() == nil
+			filterByFamily := func(ips []net.IP) []net.IP {
+				var filtered []net.IP
+				for _, ip := range ips {
+					isIPv6 := ip.To4() == nil
+					if isIPv6 == isLocalIPv6 {
+						filtered = append(filtered, ip)
+					}
+				}
+				return filtered
+			}
+			preferredIPs = filterByFamily(preferredIPs)
+			fallbackIPs = filterByFamily(fallbackIPs)
+		}
+	}
+
 	totalIPs := len(preferredIPs) + len(fallbackIPs)
 	if totalIPs == 0 {
 		return nil, fmt.Errorf("no IP addresses available")
@@ -462,6 +506,9 @@ func (p *HostPool) dialHappyEyeballs(ctx context.Context, preferredIPs, fallback
 			}
 			addr := net.JoinHostPort(ip.String(), p.port)
 			dialer := &net.Dialer{Timeout: perAddrTimeout}
+			if p.localAddr != "" {
+				dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(p.localAddr)}
+			}
 			conn, err := dialer.DialContext(dialCtx, network, addr)
 			select {
 			case resultCh <- dialResult{conn: conn, err: err}:
@@ -651,6 +698,9 @@ func (p *HostPool) dialHTTPProxy(ctx context.Context, proxy *proxyConfig) (net.C
 	}
 
 	dialer := &net.Dialer{Timeout: p.connectTimeout}
+	if p.localAddr != "" {
+		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(p.localAddr)}
+	}
 	proxyAddr := net.JoinHostPort(proxyIPs[0], proxy.Port)
 	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
@@ -706,6 +756,9 @@ func (p *HostPool) dialSOCKS5Proxy(ctx context.Context, proxy *proxyConfig) (net
 	}
 
 	dialer := &net.Dialer{Timeout: p.connectTimeout}
+	if p.localAddr != "" {
+		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(p.localAddr)}
+	}
 	proxyAddr := net.JoinHostPort(proxyIPs[0], proxy.Port)
 	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
@@ -1035,7 +1088,15 @@ func (m *Manager) GetPool(host, port string) (*HostPool, error) {
 	if port == "" {
 		port = "443"
 	}
-	key := net.JoinHostPort(host, port)
+
+	// Use connect host for pool key (domain fronting: multiple request hosts share one connection)
+	connectHost := host
+	if m.connectTo != nil {
+		if mapped, ok := m.connectTo[host]; ok {
+			connectHost = mapped
+		}
+	}
+	key := net.JoinHostPort(connectHost, port)
 
 	m.mu.RLock()
 	if m.closed {
@@ -1062,7 +1123,12 @@ func (m *Manager) GetPool(host, port string) (*HostPool, error) {
 		return pool, nil
 	}
 
-	pool = NewHostPoolWithConfig(host, port, m.preset, m.dnsCache, m.insecureSkipVerify, m.proxyURL, m.cachedSpec, m.cachedPSKSpec, m.shuffleSeed, m.sessionCache)
+	// Use connectHost for DNS resolution, but host (request host) for TLS SNI
+	sniHost := ""
+	if connectHost != host {
+		sniHost = host // Original request host for TLS ServerName
+	}
+	pool = NewHostPoolWithConfig(connectHost, sniHost, port, m.preset, m.dnsCache, m.insecureSkipVerify, m.proxyURL, m.cachedSpec, m.cachedPSKSpec, m.shuffleSeed, m.sessionCache)
 	if m.maxConnsPerHost > 0 {
 		pool.SetMaxConns(m.maxConnsPerHost)
 	}

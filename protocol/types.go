@@ -172,7 +172,8 @@ type SessionConfig struct {
 	ForceHTTP3        bool `json:"forceHttp3,omitempty"`
 
 	// Network options
-	PreferIPv4 bool `json:"preferIpv4,omitempty"` // Prefer IPv4 addresses over IPv6
+	PreferIPv4   bool   `json:"preferIpv4,omitempty"`   // Prefer IPv4 addresses over IPv6
+	LocalAddress string `json:"localAddress,omitempty"` // Local IP to bind outgoing connections (for IPv6 rotation)
 
 	// Domain fronting: request_host -> connect_host mapping
 	ConnectTo map[string]string `json:"connectTo,omitempty"`
@@ -187,6 +188,27 @@ type SessionConfig struct {
 	// QUIC idle timeout in seconds (default: 30)
 	// Connections are closed after this duration of inactivity
 	QuicIdleTimeout int `json:"quicIdleTimeout,omitempty"`
+
+	// KeyLogFile is the path to write TLS key log for Wireshark decryption.
+	// If set, overrides the global SSLKEYLOGFILE environment variable for this session.
+	KeyLogFile string `json:"keyLogFile,omitempty"`
+
+	// DisableECH skips ECH (Encrypted Client Hello) DNS lookup for faster first request
+	// ECH adds ~15-20ms to first connection but provides extra privacy
+	DisableECH bool `json:"disableEch,omitempty"`
+
+	// DisableSpeculativeTLS disables the speculative TLS optimization for proxy connections.
+	// When false (default), CONNECT request and TLS ClientHello are sent together,
+	// saving one round-trip (~25% faster proxy connections). Set to true if you
+	// experience issues with certain proxies.
+	DisableSpeculativeTLS bool `json:"disableSpeculativeTls,omitempty"`
+
+	// SwitchProtocol is the protocol to switch to after Refresh().
+	// Valid values: "h1", "h2", "h3", "" (no switch).
+	// When set, Refresh() will close connections and switch to this protocol,
+	// enabling warm-up on one protocol (e.g. H3) then serving on another (e.g. H2)
+	// with TLS session resumption.
+	SwitchProtocol string `json:"switchProtocol,omitempty"`
 
 	// Default authentication (can be overridden per-request)
 	Auth *AuthConfig `json:"auth,omitempty"`

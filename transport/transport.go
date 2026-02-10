@@ -130,6 +130,10 @@ type TransportConfig struct {
 	// QuicIdleTimeout is the idle timeout for QUIC connections (default: 30s)
 	QuicIdleTimeout time.Duration
 
+	// LocalAddr is the local IP address to bind outgoing connections to.
+	// Used for IPv6 rotation with IP_FREEBIND on Linux.
+	LocalAddr string
+
 	// SessionCacheBackend is an optional distributed cache for TLS sessions.
 	// When set, TLS session tickets will be stored/retrieved from this backend,
 	// enabling session sharing across multiple instances.
@@ -138,6 +142,17 @@ type TransportConfig struct {
 	// SessionCacheErrorCallback is called when backend operations fail.
 	// This is optional but recommended for monitoring backend health.
 	SessionCacheErrorCallback ErrorCallback
+
+	// KeyLogWriter is an optional writer for TLS key logging.
+	// When set, TLS master secrets are written in NSS key log format
+	// for traffic decryption in Wireshark.
+	// If nil, falls back to GetKeyLogWriter() (SSLKEYLOGFILE env var).
+	KeyLogWriter io.Writer
+
+	// DisableSpeculativeTLS disables the speculative TLS optimization for proxy connections.
+	// When false (default), CONNECT request and TLS ClientHello are sent together,
+	// saving one round-trip. Set to true if you experience issues with certain proxies.
+	DisableSpeculativeTLS bool
 }
 
 // Request represents an HTTP request
@@ -148,6 +163,13 @@ type Request struct {
 	Body       []byte
 	BodyReader io.Reader // For streaming uploads - used instead of Body if set
 	Timeout    time.Duration
+
+	// TLSOnly is a per-request override for TLS-only mode.
+	// When set to true, preset HTTP headers are NOT applied - only TLS fingerprinting is used.
+	// When nil, the transport's TLSOnly setting is used.
+	// This is useful for LocalProxy where each request can have different TLS-only settings
+	// via the X-HTTPCloak-TlsOnly header.
+	TLSOnly *bool
 }
 
 // RedirectInfo contains information about a redirect response
@@ -339,11 +361,10 @@ func NewTransportWithConfig(presetName string, proxy *ProxyConfig, config *Trans
 				t.h3Transport = h3Transport
 			}
 		} else {
-			// HTTP proxy - HTTP/3 doesn't work through HTTP proxies.
-			// Don't create H3 transport — its constructor opens a UDP socket and
-			// creates QUIC infrastructure that lingers ~60s on Close() even when
-			// never used, because quic-go waits for graceful drain.
+			// HTTP proxy - HTTP/3 doesn't work through HTTP proxies
+			// Store error so H3 requests fail explicitly
 			t.h3ProxyError = fmt.Errorf("HTTP proxy does not support HTTP/3 (QUIC requires UDP)")
+			t.h3Transport = NewHTTP3TransportWithTransportConfig(preset, dnsCache, config)
 		}
 	} else {
 		// No proxy - HTTP/3 works directly
@@ -370,6 +391,13 @@ func (t *Transport) SetInsecureSkipVerify(skip bool) {
 	}
 }
 
+// SetDisableECH disables ECH lookup for faster first request
+func (t *Transport) SetDisableECH(disable bool) {
+	if t.h3Transport != nil {
+		t.h3Transport.SetDisableECH(disable)
+	}
+}
+
 // SetProxy sets or updates the proxy configuration
 // Note: This recreates the underlying transports
 func (t *Transport) SetProxy(proxy *ProxyConfig) {
@@ -378,10 +406,7 @@ func (t *Transport) SetProxy(proxy *ProxyConfig) {
 	// Close existing transports
 	t.h1Transport.Close()
 	t.h2Transport.Close()
-	if t.h3Transport != nil {
-		t.h3Transport.Close()
-		t.h3Transport = nil
-	}
+	t.h3Transport.Close()
 
 	// Recreate HTTP/1.1 and HTTP/2 with new proxy config
 	t.h1Transport = NewHTTP1TransportWithProxy(t.preset, t.dnsCache, proxy)
@@ -417,13 +442,12 @@ func (t *Transport) SetProxy(proxy *ProxyConfig) {
 			} else {
 				t.h3Transport = h3Transport
 			}
+		} else {
+			t.h3Transport = NewHTTP3Transport(t.preset, t.dnsCache)
 		}
-		// else: HTTP proxy — don't create H3 transport (QUIC can't traverse HTTP proxies)
-	} else if proxy == nil {
-		// No proxy - HTTP/3 works directly
+	} else {
 		t.h3Transport = NewHTTP3Transport(t.preset, t.dnsCache)
 	}
-	// else: proxy set but no UDP URL — don't create H3
 }
 
 // SetPreset changes the fingerprint preset
@@ -433,10 +457,7 @@ func (t *Transport) SetPreset(presetName string) {
 	// Close all transports
 	t.h1Transport.Close()
 	t.h2Transport.Close()
-	if t.h3Transport != nil {
-		t.h3Transport.Close()
-		t.h3Transport = nil
-	}
+	t.h3Transport.Close()
 
 	// Recreate HTTP/1.1 and HTTP/2 with new preset
 	t.h1Transport = NewHTTP1TransportWithProxy(t.preset, t.dnsCache, t.proxy)
@@ -458,10 +479,10 @@ func (t *Transport) SetPreset(presetName string) {
 			} else {
 				t.h3Transport = h3Transport
 			}
+		} else {
+			t.h3Transport = NewHTTP3Transport(t.preset, t.dnsCache)
 		}
-		// else: HTTP proxy — don't create H3 transport
 	} else {
-		// No proxy - HTTP/3 works directly
 		t.h3Transport = NewHTTP3Transport(t.preset, t.dnsCache)
 	}
 }
@@ -499,20 +520,13 @@ func IsMASQUEProxy(proxyURL string) bool {
 		return true
 	}
 
-	// Auto-detect known MASQUE providers with https:// scheme
+	// Auto-detect MASQUE based on URL path containing MASQUE endpoints
+	// MASQUE proxies use specific paths like /.well-known/masque/ or /connect-udp/
+	// Don't auto-detect based on hostname alone - providers use different ports for different protocols
 	if parsed.Scheme == "https" {
-		// Check against known MASQUE proxy providers
-		host := parsed.Hostname()
-		knownProviders := []string{
-			"brd.superproxy.io",
-			"zproxy.lum-superproxy.io",
-			"lum-superproxy.io",
-			"pr.oxylabs.io",
-		}
-		for _, provider := range knownProviders {
-			if strings.Contains(host, provider) || strings.HasSuffix(host, provider) {
-				return true
-			}
+		path := strings.ToLower(parsed.Path)
+		if strings.Contains(path, "masque") || strings.Contains(path, "connect-udp") {
+			return true
 		}
 	}
 
@@ -799,11 +813,8 @@ func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error)
 		}
 	}
 
-	// Race HTTP/3 and HTTP/2 in parallel if H3 is supported.
-	// Skip H3 race when a proxy is configured — QUIC cannot traverse HTTP CONNECT
-	// proxies, so the H3 leg always fails but spawns goroutines that linger ~60s
-	// waiting for QUIC graceful drain.
-	if t.preset.SupportHTTP3 && t.proxy == nil {
+	// Race HTTP/3 and HTTP/2 in parallel if H3 is supported
+	if t.preset.SupportHTTP3 {
 		resp, protocol, err := t.raceH3H2(ctx, req)
 		if err == nil {
 			t.protocolSupportMu.Lock()
@@ -1064,9 +1075,15 @@ func (t *Transport) doHTTP1(ctx context.Context, req *Request) (*Response, error
 		return nil, NewRequestError("create_request", host, port, "h1", err)
 	}
 
+	// Determine effective TLS-only mode: per-request override takes precedence
+	effectiveTLSOnly := t.tlsOnly
+	if req.TLSOnly != nil {
+		effectiveTLSOnly = *req.TLSOnly
+	}
+
 	// Set preset headers (with ordering for fingerprinting)
 	// Pass "h1" protocol so Chrome presets don't send Priority header on HTTP/1.1
-	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.tlsOnly, "h1")
+	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), effectiveTLSOnly, "h1")
 
 	// Override with custom headers (multi-value support)
 	// Use Set for first value to replace preset headers, Add for additional values
@@ -1171,8 +1188,14 @@ func (t *Transport) doHTTP1WithTLSConn(ctx context.Context, req *Request, alpnEr
 		return nil, NewRequestError("create_request", host, port, "h1", err)
 	}
 
+	// Determine effective TLS-only mode: per-request override takes precedence
+	effectiveTLSOnly := t.tlsOnly
+	if req.TLSOnly != nil {
+		effectiveTLSOnly = *req.TLSOnly
+	}
+
 	// Set preset headers - pass "h1" protocol so Chrome presets don't send Priority header
-	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.tlsOnly, "h1")
+	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), effectiveTLSOnly, "h1")
 
 	// Override with custom headers (multi-value support)
 	// Use Set for first value to replace preset headers, Add for additional values
@@ -1284,8 +1307,14 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 		return nil, NewRequestError("create_request", host, port, "h2", err)
 	}
 
+	// Determine effective TLS-only mode: per-request override takes precedence
+	effectiveTLSOnly := t.tlsOnly
+	if req.TLSOnly != nil {
+		effectiveTLSOnly = *req.TLSOnly
+	}
+
 	// Set preset headers (with ordering for fingerprinting)
-	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.tlsOnly, "h2")
+	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), effectiveTLSOnly, "h2")
 
 	// Override with custom headers (multi-value support)
 	// Use Set for first value to replace preset headers, Add for additional values
@@ -1412,8 +1441,14 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 		return nil, NewRequestError("create_request", host, port, "h3", err)
 	}
 
+	// Determine effective TLS-only mode: per-request override takes precedence
+	effectiveTLSOnly := t.tlsOnly
+	if req.TLSOnly != nil {
+		effectiveTLSOnly = *req.TLSOnly
+	}
+
 	// Set preset headers (with ordering for fingerprinting)
-	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.tlsOnly, "h3")
+	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), effectiveTLSOnly, "h3")
 
 	// Override with custom headers (multi-value support)
 	// Use Set for first value to replace preset headers, Add for additional values
@@ -1495,9 +1530,7 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 func (t *Transport) Close() {
 	t.h1Transport.Close()
 	t.h2Transport.Close()
-	if t.h3Transport != nil {
-		t.h3Transport.Close()
-	}
+	t.h3Transport.Close()
 }
 
 // Refresh closes all connections but keeps TLS session caches intact.
@@ -1506,21 +1539,28 @@ func (t *Transport) Close() {
 func (t *Transport) Refresh() {
 	t.h1Transport.Refresh()
 	t.h2Transport.Refresh()
-	if t.h3Transport != nil {
-		t.h3Transport.Refresh()
-	}
+	t.h3Transport.Refresh()
+}
+
+// RefreshWithProtocol closes all connections and switches to a new protocol.
+// TLS session caches are preserved for 0-RTT resumption on the new protocol.
+// This enables warming up TLS tickets on one protocol (e.g. H3) then serving
+// requests on another (e.g. H2) with session resumption.
+func (t *Transport) RefreshWithProtocol(p Protocol) {
+	t.h1Transport.Refresh()
+	t.h2Transport.Refresh()
+	t.h3Transport.Refresh()
+	t.SetProtocol(p)
+	t.ClearProtocolCache()
 }
 
 // Stats returns transport statistics
 func (t *Transport) Stats() map[string]interface{} {
-	stats := map[string]interface{}{
+	return map[string]interface{}{
 		"http1": t.h1Transport.Stats(),
 		"http2": t.h2Transport.Stats(),
+		"http3": t.h3Transport.Stats(),
 	}
-	if t.h3Transport != nil {
-		stats["http3"] = t.h3Transport.Stats()
-	}
-	return stats
 }
 
 // GetDNSCache returns the DNS cache
@@ -1697,9 +1737,36 @@ func readBodyOptimized(body io.Reader, contentLength int64) ([]byte, func(), err
 		}
 		return buf[:n], func() {}, nil
 	}
-	// Fall back to io.ReadAll for unknown/chunked content length
-	data, err := io.ReadAll(body)
-	return data, func() {}, err
+	// For unknown/chunked content length, use pooled buffer to avoid repeated grow+copy.
+	// io.ReadAll starts at 512 bytes and doubles — wasteful for typical 50-500KB responses.
+	// We use a 1MB pooled buffer and read into it directly.
+	bufPtr, release := getPooledBuffer(1 * 1024 * 1024)
+	buf := *bufPtr
+	n := 0
+	for {
+		if n == len(buf) {
+			// Buffer full — grow by doubling (rare: response > 1MB with no Content-Length)
+			release() // release pool buffer, we're outgrowing it
+			release = func() {}
+			newBuf := make([]byte, len(buf)*2)
+			copy(newBuf, buf[:n])
+			buf = newBuf
+		}
+		nn, err := body.Read(buf[n:])
+		n += nn
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			release()
+			return nil, nil, err
+		}
+	}
+	// Copy to right-sized slice so we don't hold the full pool buffer
+	result := make([]byte, n)
+	copy(result, buf[:n])
+	release()
+	return result, func() {}, nil
 }
 
 func decompress(data []byte, encoding string) ([]byte, error) {

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -134,6 +135,12 @@ type HTTP3Transport struct {
 
 	// Skip TLS certificate verification (for testing)
 	insecureSkipVerify bool
+
+	// Skip ECH lookup for faster first request (ECH is optional privacy feature)
+	disableECH bool
+
+	// Local address for binding outgoing connections (IPv6 rotation)
+	localAddr string
 }
 
 // SetInsecureSkipVerify sets whether to skip TLS certificate verification
@@ -142,6 +149,17 @@ func (t *HTTP3Transport) SetInsecureSkipVerify(skip bool) {
 	if t.tlsConfig != nil {
 		t.tlsConfig.InsecureSkipVerify = skip
 	}
+}
+
+// SetLocalAddr sets the local IP address for outgoing connections
+func (t *HTTP3Transport) SetLocalAddr(addr string) {
+	t.localAddr = addr
+}
+
+// SetDisableECH disables ECH (Encrypted Client Hello) lookup for faster first request
+// ECH is an optional privacy feature - disabling it saves ~15-20ms on first connection
+func (t *HTTP3Transport) SetDisableECH(disable bool) {
+	t.disableECH = disable
 }
 
 // hasSessionForHost checks if there's a cached TLS session for the given host
@@ -244,6 +262,14 @@ func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *
 		}
 	}
 
+	// Determine key log writer - config override or global
+	var keyLogWriter io.Writer
+	if config != nil && config.KeyLogWriter != nil {
+		keyLogWriter = config.KeyLogWriter
+	} else {
+		keyLogWriter = GetKeyLogWriter()
+	}
+
 	// Create TLS config for QUIC
 	// Only enable session cache if we have PSK spec - prevents panic when session
 	// is cached but spec doesn't have PSK extension (TOCTOU race mitigation)
@@ -251,6 +277,7 @@ func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *
 		NextProtos:         []string{http3.NextProtoH3},
 		MinVersion:         tls.VersionTLS13,
 		InsecureSkipVerify: t.insecureSkipVerify,
+		KeyLogWriter:       keyLogWriter,
 	}
 	if t.cachedClientHelloSpecPSK != nil {
 		t.tlsConfig.ClientSessionCache = t.sessionCache
@@ -312,12 +339,28 @@ func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *
 		additionalSettings[settingH3Datagram] = 1               // Chrome enables H3_DATAGRAM
 	}
 
+	// Apply localAddr from config
+	if config != nil && config.LocalAddr != "" {
+		t.localAddr = config.LocalAddr
+	}
+
 	// Create QUIC transport for direct connections
 	// We need a bound UDP socket for quic.Transport
-	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	var localUDPAddr *net.UDPAddr
+	if t.localAddr != "" {
+		localUDPAddr = &net.UDPAddr{IP: net.ParseIP(t.localAddr)}
+	} else {
+		localUDPAddr = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	}
+	udpConn, err := net.ListenUDP("udp", localUDPAddr)
 	if err != nil {
 		// Fallback to IPv6 if IPv4 fails
-		udpConn, err = net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6zero, Port: 0})
+		if t.localAddr != "" {
+			localUDPAddr = &net.UDPAddr{IP: net.ParseIP(t.localAddr)}
+		} else {
+			localUDPAddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
+		}
+		udpConn, err = net.ListenUDP("udp6", localUDPAddr)
 		if err != nil {
 			return nil // Will use http3.Transport's default behavior
 		}
@@ -388,6 +431,11 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		echConfigCache: make(map[string][]byte),
 	}
 
+	// Apply localAddr from config
+	if config != nil && config.LocalAddr != "" {
+		t.localAddr = config.LocalAddr
+	}
+
 	// Get ClientHelloID for TLS fingerprinting
 	var clientHelloID *utls.ClientHelloID
 	if preset.QUICClientHelloID.Client != "" {
@@ -411,6 +459,14 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		}
 	}
 
+	// Determine key log writer - config override or global
+	var keyLogWriter io.Writer
+	if config != nil && config.KeyLogWriter != nil {
+		keyLogWriter = config.KeyLogWriter
+	} else {
+		keyLogWriter = GetKeyLogWriter()
+	}
+
 	// Create TLS config for QUIC
 	// Only enable session cache if we have PSK spec - prevents panic when session
 	// is cached but spec doesn't have PSK extension (TOCTOU race mitigation)
@@ -418,6 +474,7 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		NextProtos:         []string{http3.NextProtoH3},
 		MinVersion:         tls.VersionTLS13,
 		InsecureSkipVerify: t.insecureSkipVerify,
+		KeyLogWriter:       keyLogWriter,
 	}
 	if t.cachedClientHelloSpecPSK != nil {
 		t.tlsConfig.ClientSessionCache = t.sessionCache
@@ -556,6 +613,11 @@ func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache
 		echConfigCache: make(map[string][]byte),
 	}
 
+	// Apply localAddr from config
+	if config != nil && config.LocalAddr != "" {
+		t.localAddr = config.LocalAddr
+	}
+
 	// Get ClientHelloID for TLS fingerprinting
 	var clientHelloID *utls.ClientHelloID
 	if preset.QUICClientHelloID.Client != "" {
@@ -590,6 +652,14 @@ func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache
 		}
 	}
 
+	// Determine key log writer - config override or global
+	var keyLogWriter io.Writer
+	if config != nil && config.KeyLogWriter != nil {
+		keyLogWriter = config.KeyLogWriter
+	} else {
+		keyLogWriter = GetKeyLogWriter()
+	}
+
 	// Create TLS config for QUIC
 	// Only enable session cache if we have PSK spec - prevents panic when session
 	// is cached but spec doesn't have PSK extension (TOCTOU race mitigation)
@@ -597,6 +667,7 @@ func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache
 		NextProtos:         []string{http3.NextProtoH3},
 		MinVersion:         tls.VersionTLS13,
 		InsecureSkipVerify: t.insecureSkipVerify,
+		KeyLogWriter:       keyLogWriter,
 	}
 	if t.cachedClientHelloSpecPSK != nil {
 		t.tlsConfig.ClientSessionCache = t.sessionCache
@@ -804,10 +875,45 @@ func (t *HTTP3Transport) dialQUICWithProxy(ctx context.Context, addr string, tls
 	// Get the connection host (may be different for domain fronting)
 	connectHost := t.getConnectHost(host)
 
-	// Resolve DNS to get all addresses - resolve connection host, not request host
-	ips, err := t.dnsCache.Resolve(ctx, connectHost)
-	if err != nil {
-		return nil, fmt.Errorf("DNS resolution failed for %s: %w", connectHost, err)
+	// Run DNS resolution and ECH config fetch in parallel
+	// Both are independent network lookups that can be done concurrently
+	var ips []net.IP
+	var dnsErr error
+	var echConfigList []byte
+
+	if t.disableECH {
+		// ECH disabled - just do DNS
+		ips, dnsErr = t.dnsCache.Resolve(ctx, connectHost)
+	} else {
+		// Run DNS and ECH in parallel
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			ips, dnsErr = t.dnsCache.Resolve(ctx, connectHost)
+		}()
+
+		go func() {
+			defer wg.Done()
+			echConfigList = t.getECHConfig(ctx, host)
+		}()
+
+		// Context-aware wait: unblock if context expires even if goroutines are still running
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	if dnsErr != nil {
+		return nil, fmt.Errorf("DNS resolution failed for %s: %w", connectHost, dnsErr)
 	}
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("no IP addresses found for %s", connectHost)
@@ -846,21 +952,25 @@ func (t *HTTP3Transport) dialQUICWithProxy(ctx context.Context, addr string, tls
 	cfgCopy.CachedClientHelloSpec = t.getSpecForHost(host)
 
 	// Race IPv6 and IPv4 connections (Happy Eyeballs style)
-	// Try IPv6 first, then IPv4 after short timeout
-	// Pass request host for ECH config fetching
-	return t.raceQUICDial(ctx, host, ipv6Addrs, ipv4Addrs, tlsCfgCopy, cfgCopy)
+	// Use pre-fetched ECH config directly to avoid redundant fetch
+	return t.raceQUICDialWithECH(ctx, host, ipv6Addrs, ipv4Addrs, tlsCfgCopy, cfgCopy, echConfigList)
 }
 
-// raceQUICDial implements Happy Eyeballs-style connection racing
+// raceQUICDial implements Happy Eyeballs-style connection racing (legacy, fetches ECH internally)
 // Tries IPv6 first with a short timeout, then falls back to IPv4 if needed
 func (t *HTTP3Transport) raceQUICDial(ctx context.Context, host string, ipv6Addrs, ipv4Addrs []*net.UDPAddr, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+	// Fetch ECH config (legacy path - used by proxy dial functions)
+	echConfigList := t.getECHConfig(ctx, host)
+	return t.raceQUICDialWithECH(ctx, host, ipv6Addrs, ipv4Addrs, tlsCfg, cfg, echConfigList)
+}
+
+// raceQUICDialWithECH implements Happy Eyeballs-style connection racing with pre-fetched ECH config
+// Tries IPv6 first with a short timeout, then falls back to IPv4 if needed
+func (t *HTTP3Transport) raceQUICDialWithECH(ctx context.Context, host string, ipv6Addrs, ipv4Addrs []*net.UDPAddr, tlsCfg *tls.Config, cfg *quic.Config, echConfigList []byte) (*quic.Conn, error) {
 	// If only one address family available, just dial it directly
 	if len(ipv6Addrs) == 0 && len(ipv4Addrs) == 0 {
 		return nil, fmt.Errorf("no addresses to dial")
 	}
-
-	// Fetch ECH config - use custom config if set, otherwise from target host
-	echConfigList := t.getECHConfig(ctx, host)
 
 	// Capture PSK spec for 0-RTT before racing (was set in dialQUICWithDNS)
 	pskSpec := cfg.CachedClientHelloSpec
@@ -902,17 +1012,29 @@ func (t *HTTP3Transport) raceQUICDial(ctx context.Context, host string, ipv6Addr
 	return t.dialFirstSuccessful(ctx, ipv4Addrs, tlsCfg, makeConfig())
 }
 
-// dialFirstSuccessful tries each address in order until one succeeds
+// dialFirstSuccessful tries each address in order until one succeeds.
+// Per-address timeout prevents a single unresponsive IP from consuming the entire timeout budget.
 func (t *HTTP3Transport) dialFirstSuccessful(ctx context.Context, addrs []*net.UDPAddr, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 	var lastErr error
-	for _, addr := range addrs {
+	for i, addr := range addrs {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
 
-		conn, err := t.quicTransport.DialEarly(ctx, addr, tlsCfg, cfg)
+		// Per-address timeout: divide remaining time evenly, cap at 10s
+		remaining := len(addrs) - i
+		perAddrTimeout := 10 * time.Second
+		if deadline, ok := ctx.Deadline(); ok {
+			budget := time.Until(deadline) / time.Duration(remaining)
+			if budget < perAddrTimeout {
+				perAddrTimeout = budget
+			}
+		}
+		addrCtx, addrCancel := context.WithTimeout(ctx, perAddrTimeout)
+		conn, err := t.quicTransport.DialEarly(addrCtx, addr, tlsCfg, cfg)
+		addrCancel()
 		if err == nil {
 			return conn, nil
 		}
@@ -947,10 +1069,48 @@ func (t *HTTP3Transport) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.
 	// Get the connection host (may be different for domain fronting)
 	connectHost := t.getConnectHost(host)
 
-	// Resolve DNS to get all addresses - resolve connection host, not request host
-	ips, err := t.dnsCache.Resolve(ctx, connectHost)
-	if err != nil {
-		return nil, fmt.Errorf("DNS resolution failed for %s: %w", connectHost, err)
+	// Run DNS resolution and ECH config fetch in parallel
+	// Both are independent network lookups that can be done concurrently
+	var ips []net.IP
+	var dnsErr error
+	var echConfigList []byte
+
+	if t.disableECH {
+		// ECH disabled - just do DNS
+		ips, dnsErr = t.dnsCache.Resolve(ctx, connectHost)
+	} else {
+		// Run DNS and ECH in parallel
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// DNS resolution goroutine
+		go func() {
+			defer wg.Done()
+			ips, dnsErr = t.dnsCache.Resolve(ctx, connectHost)
+		}()
+
+		// ECH config fetch goroutine
+		go func() {
+			defer wg.Done()
+			echConfigList = t.getECHConfig(ctx, host)
+		}()
+
+		// Context-aware wait: unblock if context expires even if goroutines are still running
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	// Check DNS result
+	if dnsErr != nil {
+		return nil, fmt.Errorf("DNS resolution failed for %s: %w", connectHost, dnsErr)
 	}
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("no IP addresses found for %s", connectHost)
@@ -960,6 +1120,28 @@ func (t *HTTP3Transport) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.
 	portInt, err := strconv.Atoi(port)
 	if err != nil {
 		return nil, fmt.Errorf("invalid port: %w", err)
+	}
+
+	// Filter IPs by local address family if set
+	if t.localAddr != "" {
+		localIP := net.ParseIP(t.localAddr)
+		if localIP != nil {
+			isLocalIPv6 := localIP.To4() == nil
+			var filtered []net.IP
+			for _, ip := range ips {
+				if (ip.To4() == nil) == isLocalIPv6 {
+					filtered = append(filtered, ip)
+				}
+			}
+			ips = filtered
+			if len(ips) == 0 {
+				family := "IPv4"
+				if isLocalIPv6 {
+					family = "IPv6"
+				}
+				return nil, fmt.Errorf("no %s addresses found for host (local address is %s)", family, t.localAddr)
+			}
+		}
 	}
 
 	// Separate IPv4 and IPv6 addresses
@@ -994,8 +1176,8 @@ func (t *HTTP3Transport) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.
 
 	// Race IPv6 and IPv4 connections (Happy Eyeballs style)
 	// Try IPv6 first, then IPv4 after short timeout
-	// Pass request host for ECH config fetching
-	return t.raceQUICDial(ctx, host, ipv6Addrs, ipv4Addrs, tlsCfgCopy, cfgCopy)
+	// Pass pre-fetched ECH config (fetched in parallel with DNS)
+	return t.raceQUICDialWithECH(ctx, host, ipv6Addrs, ipv4Addrs, tlsCfgCopy, cfgCopy, echConfigList)
 }
 
 // RoundTrip implements http.RoundTripper
@@ -1033,8 +1215,40 @@ func (t *HTTP3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 
+	// For domain fronting: swap req.URL.Host to connectHost so http3.Transport
+	// pools connections by connect host (multiple request hosts share one QUIC connection).
+	// Preserve original host in req.Host for the :authority pseudo-header.
+	requestHost := req.URL.Hostname()
+	connectHost := t.getConnectHost(requestHost)
+	if connectHost != requestHost {
+		// Set req.Host to preserve original :authority header
+		if req.Host == "" {
+			req.Host = req.URL.Host
+		}
+		// Swap URL host to connectHost for pool key
+		origURLHost := req.URL.Host
+		if req.URL.Port() != "" {
+			req.URL.Host = net.JoinHostPort(connectHost, req.URL.Port())
+		} else {
+			req.URL.Host = connectHost
+		}
+		defer func() { req.URL.Host = origURLHost }()
+	}
+
 	// Make request - http3.Transport handles connection pooling
-	resp, err := t.transport.RoundTrip(req)
+	// Retry up to 3 times on 0-RTT rejection (can happen multiple times after Refresh)
+	var resp *http.Response
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		resp, err = t.transport.RoundTrip(req)
+		if err == nil || !is0RTTRejectedError(err) {
+			break
+		}
+		// 0-RTT rejected - close unusable connection and recreate transport
+		// Use timeout to prevent blocking if QUIC drain takes too long
+		closeWithTimeout(t.transport, 3*time.Second)
+		t.recreateTransport()
+	}
 
 	// Check if a new connection was created during this request
 	t.mu.RLock()
@@ -1094,26 +1308,14 @@ func (t *HTTP3Transport) Close() error {
 	return nil
 }
 
-// closeWithTimeout calls Close() with a timeout to prevent blocking on QUIC graceful drain.
-func closeWithTimeout(c io.Closer, timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		c.Close()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(timeout):
-	}
-}
-
 // Refresh closes all QUIC connections but keeps the TLS session cache intact.
 // This simulates a browser page refresh - new QUIC connections but TLS resumption.
 func (t *HTTP3Transport) Refresh() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Close the current transport with timeout to prevent blocking on QUIC drain
+	// Close the current transport (this closes all QUIC connections)
+	// Use timeout to prevent blocking if QUIC drain takes too long
 	if t.transport != nil {
 		closeWithTimeout(t.transport, 3*time.Second)
 	}
@@ -1121,10 +1323,21 @@ func (t *HTTP3Transport) Refresh() error {
 	// Close and recreate quicTransport if it exists (for direct connections)
 	if t.quicTransport != nil && t.socks5Conn == nil && t.masqueConn == nil {
 		closeWithTimeout(t.quicTransport, 3*time.Second)
-		// Create new UDP socket
-		udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		// Create new UDP socket with localAddr binding if configured
+		var localUDPAddr *net.UDPAddr
+		if t.localAddr != "" {
+			localUDPAddr = &net.UDPAddr{IP: net.ParseIP(t.localAddr)}
+		} else {
+			localUDPAddr = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+		}
+		udpConn, err := net.ListenUDP("udp", localUDPAddr)
 		if err != nil {
-			udpConn, err = net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6zero, Port: 0})
+			if t.localAddr != "" {
+				localUDPAddr = &net.UDPAddr{IP: net.ParseIP(t.localAddr)}
+			} else {
+				localUDPAddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
+			}
+			udpConn, err = net.ListenUDP("udp6", localUDPAddr)
 			if err != nil {
 				return fmt.Errorf("failed to create UDP socket: %w", err)
 			}
@@ -1174,6 +1387,74 @@ func (t *HTTP3Transport) Refresh() error {
 	return nil
 }
 
+// closeWithTimeout closes a closer with a timeout to prevent blocking indefinitely.
+// QUIC connections may block on Close() waiting for graceful drain.
+func closeWithTimeout(c io.Closer, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		c.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
+}
+
+// is0RTTRejectedError checks if the error is due to 0-RTT rejection
+func is0RTTRejectedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// Check for 0-RTT rejection or unusable connection (which wraps 0-RTT rejection)
+	return strings.Contains(errStr, "0-RTT rejected") || strings.Contains(errStr, "conn unusable")
+}
+
+// recreateTransport recreates the HTTP/3 transport after 0-RTT rejection
+// This is called from RoundTrip when the server rejects early data
+func (t *HTTP3Transport) recreateTransport() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Generate fresh GREASE values
+	greaseSettingID := uint64(0x1f*rand.Intn(256)+0x21) | 0x0f0f0f0f00000000
+	greaseSettingValue := uint64(rand.Intn(256))
+
+	// Build additional settings
+	additionalSettings := map[uint64]uint64{
+		settingQPACKMaxTableCapacity: 65536,
+		settingQPACKBlockedStreams:   100,
+		greaseSettingID:              greaseSettingValue,
+	}
+	// Add Chrome-specific settings (not sent by Safari/iOS)
+	if t.preset == nil || !t.preset.HTTP2Settings.NoRFC7540Priorities {
+		additionalSettings[settingMaxFieldSectionSize] = 262144
+		additionalSettings[settingH3Datagram] = 1
+	}
+
+	// Determine which dial function to use
+	var dialFunc func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error)
+	if t.masqueConn != nil {
+		dialFunc = t.dialQUICWithMASQUE
+	} else if t.socks5Conn != nil {
+		dialFunc = t.dialQUICWithProxy
+	} else {
+		dialFunc = t.dialQUIC
+	}
+
+	// Recreate the transport
+	t.transport = &http3.Transport{
+		TLSClientConfig:        t.tlsConfig,
+		QUICConfig:             t.quicConfig,
+		Dial:                   dialFunc,
+		EnableDatagrams:        true,
+		AdditionalSettings:     additionalSettings,
+		MaxResponseHeaderBytes: 262144,
+		SendGreaseFrames:       true,
+	}
+}
+
 // GetSessionCache returns the TLS session cache
 func (t *HTTP3Transport) GetSessionCache() tls.ClientSessionCache {
 	return t.sessionCache
@@ -1218,24 +1499,35 @@ func (t *HTTP3Transport) SetECHConfigCache(configs map[string][]byte) {
 // Connect establishes a QUIC connection to the host without making a request.
 // This is used for protocol racing - the first protocol to connect wins.
 func (t *HTTP3Transport) Connect(ctx context.Context, host, port string) error {
-	addr := net.JoinHostPort(host, port)
+	// Use connect host for DNS resolution (may differ for domain fronting)
+	connectHost := t.getConnectHost(host)
+	addr := net.JoinHostPort(connectHost, port)
 
-	// Use DNS cache for resolution
-	ip, err := t.dnsCache.ResolveOne(ctx, host)
+	// Use DNS cache for resolution - resolve connectHost, not request host
+	ip, err := t.dnsCache.ResolveOne(ctx, connectHost)
 	if err != nil {
 		return fmt.Errorf("DNS resolution failed: %w", err)
 	}
 
 	resolvedAddr := net.JoinHostPort(ip.String(), port)
 
-	// Create TLS config
+	// Determine key log writer - config override or global
+	var keyLogWriter io.Writer
+	if t.config != nil && t.config.KeyLogWriter != nil {
+		keyLogWriter = t.config.KeyLogWriter
+	} else {
+		keyLogWriter = GetKeyLogWriter()
+	}
+
+	// Create TLS config - use request host for SNI
 	tlsCfg := &tls.Config{
 		ServerName:         host,
 		NextProtos:         []string{"h3"},
 		InsecureSkipVerify: t.insecureSkipVerify,
+		KeyLogWriter:       keyLogWriter,
 	}
 
-	// Fetch ECH configs from DNS HTTPS records
+	// Fetch ECH configs from DNS HTTPS records (use request host for ECH)
 	// This is non-blocking - if it fails, we proceed without ECH
 	echConfigList, _ := dns.FetchECHConfigs(ctx, host)
 

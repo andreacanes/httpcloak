@@ -122,6 +122,7 @@ import (
 
 	"github.com/sardanioss/httpcloak"
 	"github.com/sardanioss/httpcloak/dns"
+	"github.com/sardanioss/httpcloak/fingerprint"
 	"github.com/sardanioss/httpcloak/transport"
 )
 
@@ -186,6 +187,7 @@ var (
 	callbackMu      sync.Mutex
 	callbackCounter int64
 	asyncCallbacks  = make(map[int64]C.async_callback)
+	cancelFuncs     = make(map[int64]context.CancelFunc) // For cancelling in-flight async requests
 )
 
 // Request configuration for JSON parsing
@@ -272,6 +274,11 @@ type SessionConfig struct {
 	ECHConfigDomain string            `json:"ech_config_domain,omitempty"` // Domain to fetch ECH config from
 	TLSOnly         bool              `json:"tls_only,omitempty"`          // TLS-only mode: skip preset headers, set all manually
 	QuicIdleTimeout int               `json:"quic_idle_timeout,omitempty"` // QUIC idle timeout in seconds (default: 30)
+	LocalAddress    string            `json:"local_address,omitempty"`     // Local IP to bind outgoing connections (IPv6 rotation)
+	KeyLogFile      string            `json:"key_log_file,omitempty"`      // Path to write TLS key log for Wireshark decryption
+	DisableECH            bool              `json:"disable_ech,omitempty"`             // Disable ECH lookup for faster first request
+	DisableSpeculativeTLS bool              `json:"disable_speculative_tls,omitempty"` // Disable speculative TLS optimization for proxy connections
+	SwitchProtocol        string            `json:"switch_protocol,omitempty"`         // Protocol to switch to after Refresh()
 }
 
 // Error response
@@ -960,6 +967,31 @@ func httpcloak_session_new(configJSON *C.char) C.int64_t {
 		opts = append(opts, httpcloak.WithQuicIdleTimeout(time.Duration(config.QuicIdleTimeout)*time.Second))
 	}
 
+	// Handle local address binding (for IPv6 rotation)
+	if config.LocalAddress != "" {
+		opts = append(opts, httpcloak.WithLocalAddress(config.LocalAddress))
+	}
+
+	// Handle key log file (for Wireshark decryption)
+	if config.KeyLogFile != "" {
+		opts = append(opts, httpcloak.WithKeyLogFile(config.KeyLogFile))
+	}
+
+	// Handle ECH disabling for faster first request
+	if config.DisableECH {
+		opts = append(opts, httpcloak.WithDisableECH())
+	}
+
+	// Handle speculative TLS disabling
+	if config.DisableSpeculativeTLS {
+		opts = append(opts, httpcloak.WithDisableSpeculativeTLS())
+	}
+
+	// Handle switch protocol
+	if config.SwitchProtocol != "" {
+		opts = append(opts, httpcloak.WithSwitchProtocol(config.SwitchProtocol))
+	}
+
 	// Handle session cache if configured globally
 	backend, errorCallback := getSessionCacheBackend()
 	if backend != nil {
@@ -997,6 +1029,21 @@ func httpcloak_session_refresh(handle C.int64_t) {
 	if session != nil {
 		session.Refresh()
 	}
+}
+
+//export httpcloak_session_refresh_protocol
+func httpcloak_session_refresh_protocol(handle C.int64_t, protocol *C.char) *C.char {
+	session := getSession(handle)
+	if session == nil {
+		return makeErrorJSON(ErrInvalidSession)
+	}
+
+	proto := C.GoString(protocol)
+	if err := session.RefreshWithProtocol(proto); err != nil {
+		return makeErrorJSON(err)
+	}
+
+	return nil
 }
 
 func getSession(handle C.int64_t) *httpcloak.Session {
@@ -1183,16 +1230,28 @@ func httpcloak_register_callback(callback C.async_callback) C.int64_t {
 func httpcloak_unregister_callback(callbackID C.int64_t) {
 	callbackMu.Lock()
 	delete(asyncCallbacks, int64(callbackID))
+	delete(cancelFuncs, int64(callbackID))
 	callbackMu.Unlock()
+}
+
+//export httpcloak_cancel_request
+func httpcloak_cancel_request(callbackID C.int64_t) {
+	callbackMu.Lock()
+	cancel, exists := cancelFuncs[int64(callbackID)]
+	callbackMu.Unlock()
+	if exists {
+		cancel()
+	}
 }
 
 func invokeCallback(callbackID int64, responseJSON string, errStr string) {
 	callbackMu.Lock()
 	callback, exists := asyncCallbacks[callbackID]
-	// Auto-cleanup: remove callback after retrieval to prevent memory leaks
+	// Auto-cleanup: remove callback and cancel func after retrieval to prevent memory leaks
 	if exists {
 		delete(asyncCallbacks, callbackID)
 	}
+	delete(cancelFuncs, callbackID)
 	callbackMu.Unlock()
 
 	if !exists {
@@ -1233,13 +1292,19 @@ func httpcloak_get_async(handle C.int64_t, url *C.char, optionsJSON *C.char, cal
 		}
 	}
 
+	// Create cancellable context and store cancel func for this request
+	ctx, cancel := context.WithCancel(context.Background())
+	callbackMu.Lock()
+	cancelFuncs[int64(callbackID)] = cancel
+	callbackMu.Unlock()
+
 	go func() {
+		defer cancel()
 		if session == nil {
 			invokeCallback(int64(callbackID), "", ErrInvalidSession.Error())
 			return
 		}
 
-		ctx := context.Background()
 		req := &httpcloak.Request{
 			Method:  "GET",
 			URL:     urlStr,
@@ -1309,7 +1374,14 @@ func httpcloak_post_async(handle C.int64_t, url *C.char, body *C.char, optionsJS
 		}
 	}
 
+	// Create cancellable context and store cancel func for this request
+	ctx, cancel := context.WithCancel(context.Background())
+	callbackMu.Lock()
+	cancelFuncs[int64(callbackID)] = cancel
+	callbackMu.Unlock()
+
 	go func() {
+		defer cancel()
 		if session == nil {
 			invokeCallback(int64(callbackID), "", ErrInvalidSession.Error())
 			return
@@ -1320,7 +1392,6 @@ func httpcloak_post_async(handle C.int64_t, url *C.char, body *C.char, optionsJS
 			bodyReader = bytes.NewReader([]byte(bodyStr))
 		}
 
-		ctx := context.Background()
 		req := &httpcloak.Request{
 			Method:  "POST",
 			URL:     urlStr,
@@ -1383,7 +1454,14 @@ func httpcloak_request_async(handle C.int64_t, requestJSON *C.char, callbackID C
 		json.Unmarshal([]byte(jsonStr), &config)
 	}
 
+	// Create cancellable context and store cancel func for this request
+	ctx, cancel := context.WithCancel(context.Background())
+	callbackMu.Lock()
+	cancelFuncs[int64(callbackID)] = cancel
+	callbackMu.Unlock()
+
 	go func() {
+		defer cancel()
 		if session == nil {
 			invokeCallback(int64(callbackID), "", ErrInvalidSession.Error())
 			return
@@ -1393,11 +1471,11 @@ func httpcloak_request_async(handle C.int64_t, requestJSON *C.char, callbackID C
 			config.Method = "GET"
 		}
 
-		ctx := context.Background()
+		// Layer timeout on top of the cancellable context
 		if config.Timeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, time.Duration(config.Timeout)*time.Second)
-			defer cancel()
+			var timeoutCancel context.CancelFunc
+			ctx, timeoutCancel = context.WithTimeout(ctx, time.Duration(config.Timeout)*time.Second)
+			defer timeoutCancel()
 		}
 
 		var bodyReader io.Reader
@@ -1707,14 +1785,8 @@ func httpcloak_version() *C.char {
 
 //export httpcloak_available_presets
 func httpcloak_available_presets() *C.char {
-	// Must match exactly what's in fingerprint/presets.go
-	presets := []string{
-		"chrome-144", "chrome-144-windows", "chrome-144-linux", "chrome-144-macos",
-		"chrome-143", "chrome-143-windows", "chrome-143-linux", "chrome-143-macos",
-		"chrome-141", "chrome-133", "chrome-131",
-		"ios-chrome-143", "android-chrome-143",
-		"firefox-133", "safari-18", "ios-safari-17",
-	}
+	// Return preset names with their supported protocols
+	presets := fingerprint.AvailableWithInfo()
 	data, _ := json.Marshal(presets)
 	return C.CString(string(data))
 }

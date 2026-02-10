@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sardanioss/httpcloak/fingerprint"
 	"github.com/sardanioss/httpcloak/protocol"
 	"github.com/sardanioss/httpcloak/transport"
 )
@@ -63,6 +64,15 @@ type Session struct {
 	// Key: host (e.g., "example.com"), Value: set of requested hint names
 	clientHints map[string]map[string]bool
 
+	// Key log writer for TLS traffic decryption (Wireshark)
+	keyLogWriter io.WriteCloser
+
+	// refreshed indicates Refresh() was called - adds cache-control: max-age=0 to requests
+	refreshed bool
+
+	// switchProtocol is the protocol to switch to on Refresh()
+	switchProtocol transport.Protocol
+
 	mu     sync.RWMutex
 	active bool
 }
@@ -90,19 +100,33 @@ func NewSessionWithOptions(id string, config *protocol.SessionConfig, opts *Sess
 		}
 	}
 
-	// Create transport config with ConnectTo, ECH, TLS-only, QUIC timeout, and session cache settings
+	// Create key log writer if KeyLogFile is specified
+	var keyLogWriter io.WriteCloser
+	if config.KeyLogFile != "" {
+		var err error
+		keyLogWriter, err = transport.NewKeyLogFileWriter(config.KeyLogFile)
+		if err != nil {
+			// Log error but continue - key logging is optional
+			keyLogWriter = nil
+		}
+	}
+
+	// Create transport config with ConnectTo, ECH, TLS-only, QUIC timeout, localAddr, and session cache settings
 	var transportConfig *transport.TransportConfig
-	needsConfig := len(config.ConnectTo) > 0 || config.ECHConfigDomain != "" || config.TLSOnly || config.QuicIdleTimeout > 0
+	needsConfig := len(config.ConnectTo) > 0 || config.ECHConfigDomain != "" || config.TLSOnly || config.QuicIdleTimeout > 0 || config.LocalAddress != "" || keyLogWriter != nil || config.DisableSpeculativeTLS
 	if opts != nil && opts.SessionCacheBackend != nil {
 		needsConfig = true
 	}
 
 	if needsConfig {
 		transportConfig = &transport.TransportConfig{
-			ConnectTo:       config.ConnectTo,
-			ECHConfigDomain: config.ECHConfigDomain,
-			TLSOnly:         config.TLSOnly,
-			QuicIdleTimeout: time.Duration(config.QuicIdleTimeout) * time.Second,
+			ConnectTo:             config.ConnectTo,
+			ECHConfigDomain:       config.ECHConfigDomain,
+			TLSOnly:              config.TLSOnly,
+			QuicIdleTimeout:      time.Duration(config.QuicIdleTimeout) * time.Second,
+			LocalAddr:            config.LocalAddress,
+			KeyLogWriter:         keyLogWriter,
+			DisableSpeculativeTLS: config.DisableSpeculativeTLS,
 		}
 		// Add session cache backend if provided
 		if opts != nil {
@@ -141,17 +165,33 @@ func NewSessionWithOptions(id string, config *protocol.SessionConfig, opts *Sess
 		}
 	}
 
+	// Disable ECH lookup for faster first request
+	if config.DisableECH {
+		t.SetDisableECH(true)
+	}
+
+	// Parse switch protocol if configured
+	switchProto := transport.ProtocolAuto
+	if config.SwitchProtocol != "" {
+		p, err := parseProtocol(config.SwitchProtocol)
+		if err == nil {
+			switchProto = p
+		}
+	}
+
 	return &Session{
-		ID:           id,
-		CreatedAt:    time.Now(),
-		LastUsed:     time.Now(),
-		RequestCount: 0,
-		Config:       config,
-		transport:    t,
-		cookies:      NewCookieJar(),
-		cacheEntries: make(map[string]*cacheEntry),
-		clientHints:  make(map[string]map[string]bool),
-		active:       true,
+		ID:             id,
+		CreatedAt:      time.Now(),
+		LastUsed:       time.Now(),
+		RequestCount:   0,
+		Config:         config,
+		transport:      t,
+		cookies:        NewCookieJar(),
+		cacheEntries:   make(map[string]*cacheEntry),
+		clientHints:    make(map[string]map[string]bool),
+		keyLogWriter:   keyLogWriter,
+		switchProtocol: switchProto,
+		active:         true,
 	}
 }
 
@@ -172,6 +212,11 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 
 	if req.Headers == nil {
 		req.Headers = make(map[string][]string)
+	}
+
+	// Add cache-control: max-age=0 if session was refreshed (simulates browser F5)
+	if s.refreshed {
+		req.Headers["cache-control"] = []string{"max-age=0"}
 	}
 
 	// Add cache validation headers (If-None-Match, If-Modified-Since)
@@ -218,18 +263,6 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 	requestHost := extractHost(req.URL)
 	requestPath := extractPath(req.URL)
 	requestSecure := isSecureURL(req.URL)
-
-	// Buffer streaming body so it can be replayed on protocol fallback (H2→H1)
-	// and session-level retries. io.Reader is one-shot; req.Body ([]byte) is replayable
-	// because doHTTP1/doHTTP2 wrap it in bytes.NewReader() each time.
-	if req.BodyReader != nil {
-		body, err := io.ReadAll(req.BodyReader)
-		if err != nil {
-			return nil, fmt.Errorf("failed to buffer request body: %w", err)
-		}
-		req.Body = body
-		req.BodyReader = nil
-	}
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		// Add session cookies to request headers BEFORE each attempt
@@ -857,11 +890,33 @@ func (s *Session) Close() {
 	if s.transport != nil {
 		s.transport.Close()
 	}
+
+	// Close key log writer if we opened one
+	if s.keyLogWriter != nil {
+		s.keyLogWriter.Close()
+		s.keyLogWriter = nil
+	}
+}
+
+// parseProtocol converts a protocol string to transport.Protocol.
+func parseProtocol(proto string) (transport.Protocol, error) {
+	switch proto {
+	case "h1", "http1", "1":
+		return transport.ProtocolHTTP1, nil
+	case "h2", "http2", "2":
+		return transport.ProtocolHTTP2, nil
+	case "h3", "http3", "3":
+		return transport.ProtocolHTTP3, nil
+	case "auto", "":
+		return transport.ProtocolAuto, nil
+	default:
+		return transport.ProtocolAuto, fmt.Errorf("invalid protocol %q: must be h1, h2, h3, or auto", proto)
+	}
 }
 
 // Refresh closes all connections but keeps TLS session caches and cookies intact.
 // This simulates a browser page refresh - new TCP/QUIC connections but TLS resumption.
-// Useful for resetting connection state without losing session tickets or cookies.
+// If a switchProtocol was configured, the session switches to that protocol.
 func (s *Session) Refresh() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -870,9 +925,50 @@ func (s *Session) Refresh() {
 		return
 	}
 
+	// Set refreshed flag - adds cache-control: max-age=0 to subsequent requests
+	s.refreshed = true
+
 	if s.transport != nil {
-		s.transport.Refresh()
+		if s.switchProtocol != transport.ProtocolAuto {
+			s.transport.RefreshWithProtocol(s.switchProtocol)
+		} else {
+			s.transport.Refresh()
+		}
 	}
+}
+
+// RefreshWithProtocol closes all connections and switches to a new protocol.
+// The protocol change persists for future Refresh() calls as well.
+// Valid protocols: "h1", "h2", "h3", "auto".
+func (s *Session) RefreshWithProtocol(proto string) error {
+	p, err := parseProtocol(proto)
+	if err != nil {
+		return err
+	}
+
+	// Validate H3 support if switching to H3
+	if p == transport.ProtocolHTTP3 && s.Config != nil {
+		preset := fingerprint.Get(s.Config.Preset)
+		if preset != nil && !preset.SupportHTTP3 {
+			return fmt.Errorf("preset %q does not support HTTP/3", s.Config.Preset)
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.active {
+		return ErrSessionClosed
+	}
+
+	s.refreshed = true
+	s.switchProtocol = p
+
+	if s.transport != nil {
+		s.transport.RefreshWithProtocol(p)
+	}
+
+	return nil
 }
 
 // Touch updates the last used timestamp

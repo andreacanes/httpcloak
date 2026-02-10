@@ -25,6 +25,7 @@ package httpcloak
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"io"
 	"strings"
@@ -36,6 +37,16 @@ import (
 	"github.com/sardanioss/httpcloak/session"
 	"github.com/sardanioss/httpcloak/transport"
 )
+
+// systemRoots is pre-loaded at init time to avoid ~40ms delay on first TLS connection
+var systemRoots *x509.CertPool
+
+func init() {
+	// Pre-load system root CA certificates at package init time.
+	// This normally takes ~40ms on first TLS connection, so we do it eagerly.
+	// The result is cached by the Go runtime, so subsequent calls are instant.
+	systemRoots, _ = x509.SystemCertPool()
+}
 
 // Client is an HTTP client with browser fingerprint spoofing
 type Client struct {
@@ -106,6 +117,13 @@ type Request struct {
 	Headers map[string][]string // Multi-value headers (matches http.Header)
 	Body    io.Reader           // Streaming body for uploads
 	Timeout time.Duration
+
+	// TLSOnly is a per-request override for TLS-only mode.
+	// When set to true, preset HTTP headers are NOT applied - only TLS fingerprinting is used.
+	// When nil, the session's TLSOnly setting is used.
+	// This is useful for LocalProxy where each request can have different TLS-only settings
+	// via the X-HTTPCloak-TlsOnly header.
+	TLSOnly *bool
 }
 
 // RedirectInfo contains information about a redirect response
@@ -292,6 +310,11 @@ type sessionConfig struct {
 	echConfigDomain    string            // Domain to fetch ECH config from
 	tlsOnly            bool              // TLS-only mode: skip preset headers, set all manually
 	quicIdleTimeout    time.Duration     // QUIC idle timeout (default: 30s)
+	localAddr          string            // Local IP address to bind outgoing connections
+	keyLogFile         string            // Path to write TLS key log for Wireshark decryption
+	disableECH            bool   // Disable ECH lookup for faster first request
+	disableSpeculativeTLS bool   // Disable speculative TLS optimization for proxy connections
+	switchProtocol        string // Protocol to switch to after Refresh() (e.g. "h1", "h2", "h3")
 
 	// Distributed session cache
 	sessionCacheBackend       transport.SessionCacheBackend
@@ -403,6 +426,52 @@ func WithSessionPreferIPv4() SessionOption {
 	}
 }
 
+// WithLocalAddress binds outgoing connections to a specific local IP address.
+// Useful for IPv6 rotation when you have a large IPv6 prefix and want to
+// rotate source IPs per session. Works with IP_FREEBIND on Linux.
+// Supports both IPv4 and IPv6 addresses (e.g., "192.168.1.100" or "2001:db8::1").
+func WithLocalAddress(addr string) SessionOption {
+	return func(c *sessionConfig) {
+		c.localAddr = addr
+	}
+}
+
+// WithKeyLogFile sets the path to write TLS key log for Wireshark decryption.
+// This overrides the global SSLKEYLOGFILE environment variable for this session.
+func WithKeyLogFile(path string) SessionOption {
+	return func(c *sessionConfig) {
+		c.keyLogFile = path
+	}
+}
+
+// WithDisableECH disables ECH (Encrypted Client Hello) lookup for faster first request.
+// ECH is an optional privacy feature that adds ~15-20ms to first connection.
+// Disabling it has no security impact, only privacy implications.
+func WithDisableECH() SessionOption {
+	return func(c *sessionConfig) {
+		c.disableECH = true
+	}
+}
+
+// WithDisableSpeculativeTLS disables the speculative TLS optimization for proxy connections.
+// By default, httpcloak sends the CONNECT request and TLS ClientHello together to save
+// one round-trip (~25% faster). Disable this if you experience issues with certain proxies.
+func WithDisableSpeculativeTLS() SessionOption {
+	return func(c *sessionConfig) {
+		c.disableSpeculativeTLS = true
+	}
+}
+
+// WithSwitchProtocol sets the protocol to switch to after Refresh().
+// This enables warming up TLS tickets on one protocol (e.g. H3) then serving
+// requests on another (e.g. H2) with TLS session resumption.
+// Valid values: "h1", "h2", "h3".
+func WithSwitchProtocol(protocol string) SessionOption {
+	return func(c *sessionConfig) {
+		c.switchProtocol = protocol
+	}
+}
+
 // WithConnectTo sets a host mapping for domain fronting.
 // Requests to requestHost will connect to connectHost instead.
 // The TLS SNI and Host header will still use requestHost.
@@ -480,6 +549,11 @@ func NewSession(preset string, opts ...SessionOption) *Session {
 		ECHConfigDomain:    cfg.echConfigDomain,
 		TLSOnly:            cfg.tlsOnly,
 		QuicIdleTimeout:    int(cfg.quicIdleTimeout.Seconds()),
+		LocalAddress:       cfg.localAddr,
+		KeyLogFile:         cfg.keyLogFile,
+		DisableECH:            cfg.disableECH,
+		DisableSpeculativeTLS: cfg.disableSpeculativeTLS,
+		SwitchProtocol:        cfg.switchProtocol,
 	}
 
 	// Retry configuration
@@ -531,6 +605,7 @@ func (s *Session) Do(ctx context.Context, req *Request) (*Response, error) {
 		URL:        req.URL,
 		Headers:    req.Headers,
 		BodyReader: req.Body,
+		TLSOnly:    req.TLSOnly,
 	}
 
 	resp, err := s.inner.Request(ctx, sReq)
@@ -568,6 +643,7 @@ func (s *Session) DoWithBody(ctx context.Context, req *Request, bodyReader io.Re
 		URL:        req.URL,
 		Headers:    req.Headers,
 		BodyReader: bodyReader,
+		TLSOnly:    req.TLSOnly,
 	}
 
 	resp, err := s.inner.Request(ctx, sReq)
@@ -672,9 +748,16 @@ func (s *Session) Close() {
 
 // Refresh closes all connections but keeps TLS session caches and cookies intact.
 // This simulates a browser page refresh - new TCP/QUIC connections but TLS resumption.
-// Useful for resetting connection state without losing session tickets or cookies.
+// If a switchProtocol was configured, the session switches to that protocol.
 func (s *Session) Refresh() {
 	s.inner.Refresh()
+}
+
+// RefreshWithProtocol closes all connections and switches to a new protocol.
+// The protocol change persists for future Refresh() calls as well.
+// Valid protocols: "h1", "h2", "h3", "auto".
+func (s *Session) RefreshWithProtocol(protocol string) error {
+	return s.inner.RefreshWithProtocol(protocol)
 }
 
 // Save exports session state (cookies, TLS sessions) to a file
@@ -747,6 +830,7 @@ func (s *Session) DoStream(ctx context.Context, req *Request) (*StreamResponse, 
 		URL:        req.URL,
 		Headers:    req.Headers,
 		BodyReader: req.Body,
+		TLSOnly:    req.TLSOnly,
 	}
 
 	resp, err := s.inner.RequestStream(ctx, sReq)

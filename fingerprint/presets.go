@@ -1083,3 +1083,22 @@ func Available() []string {
 	}
 	return names
 }
+
+// PresetInfo contains metadata about a preset's protocol support.
+type PresetInfo struct {
+	Protocols []string `json:"protocols"`
+}
+
+// AvailableWithInfo returns a map of preset names to their supported protocols.
+func AvailableWithInfo() map[string]PresetInfo {
+	result := make(map[string]PresetInfo, len(presets))
+	for name, presetFn := range presets {
+		p := presetFn()
+		protocols := []string{"h1", "h2"}
+		if p.SupportHTTP3 {
+			protocols = append(protocols, "h3")
+		}
+		result[name] = PresetInfo{Protocols: protocols}
+	}
+	return result
+}

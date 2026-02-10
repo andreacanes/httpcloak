@@ -42,6 +42,7 @@ type HTTP1Transport struct {
 	connectTimeout      time.Duration
 	responseTimeout     time.Duration
 	insecureSkipVerify  bool
+	localAddr           string // Local IP to bind outgoing connections
 
 	// Cleanup
 	stopCleanup chan struct{}
@@ -103,12 +104,17 @@ func NewHTTP1TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		stopCleanup:         make(chan struct{}),
 	}
 
+	// Apply localAddr from config
+	if config != nil && config.LocalAddr != "" {
+		t.localAddr = config.LocalAddr
+	}
+
 	go t.cleanupLoop()
 
 	return t
 }
 
-// SetConnectTo sets a host mapping for domain fronting (stub for HTTP/1.1)
+// SetConnectTo sets a host mapping for domain fronting
 func (t *HTTP1Transport) SetConnectTo(requestHost, connectHost string) {
 	if t.config == nil {
 		t.config = &TransportConfig{}
@@ -119,9 +125,25 @@ func (t *HTTP1Transport) SetConnectTo(requestHost, connectHost string) {
 	t.config.ConnectTo[requestHost] = connectHost
 }
 
+// getConnectHost returns the connection host for DNS resolution
+func (t *HTTP1Transport) getConnectHost(requestHost string) string {
+	if t.config == nil || t.config.ConnectTo == nil {
+		return requestHost
+	}
+	if connectHost, ok := t.config.ConnectTo[requestHost]; ok {
+		return connectHost
+	}
+	return requestHost
+}
+
 // SetInsecureSkipVerify sets whether to skip TLS verification
 func (t *HTTP1Transport) SetInsecureSkipVerify(skip bool) {
 	t.insecureSkipVerify = skip
+}
+
+// SetLocalAddr sets the local IP address for outgoing connections
+func (t *HTTP1Transport) SetLocalAddr(addr string) {
+	t.localAddr = addr
 }
 
 // RoundTrip implements http.RoundTripper
@@ -151,7 +173,9 @@ func (t *HTTP1Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 
-	key := fmt.Sprintf("%s://%s:%s", scheme, host, port)
+	// Use connect host for pool key (domain fronting: multiple request hosts share one connection)
+	connectHost := t.getConnectHost(host)
+	key := fmt.Sprintf("%s://%s:%s", scheme, connectHost, port)
 
 	// Try to get an idle connection
 	conn, err := t.getIdleConn(key)
@@ -173,7 +197,7 @@ func (t *HTTP1Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		conn.close()
 	}
 
-	// Create new connection
+	// Create new connection (pass request host for SNI, connectHost used internally for DNS)
 	conn, err = t.createConn(req.Context(), host, port, scheme)
 	if err != nil {
 		return nil, err
@@ -344,20 +368,24 @@ func (t *HTTP1Transport) StreamRoundTrip(req *http.Request) (*http.Response, err
 }
 
 // createConn creates a new HTTP/1.1 connection
+// host is the request host (used for TLS SNI), DNS resolution uses getConnectHost
 func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme string) (*http1Conn, error) {
 	var rawConn net.Conn
 	var err error
 
-	targetAddr := net.JoinHostPort(host, port)
+	// Use connect host for DNS resolution and proxy CONNECT (may differ for domain fronting)
+	connectHost := t.getConnectHost(host)
+	targetAddr := net.JoinHostPort(connectHost, port)
 
 	if t.proxy != nil && t.proxy.URL != "" {
-		rawConn, err = t.dialThroughProxy(ctx, host, port)
+		rawConn, err = t.dialThroughProxy(ctx, connectHost, port)
 		if err != nil {
 			return nil, NewProxyError("dial_proxy", host, port, err)
 		}
 	} else {
 		// Direct connection with DNS resolution and IPv4/IPv6 fallback
-		ips, err := t.dnsCache.ResolveAllSorted(ctx, host)
+		// Resolve connectHost (may be different from request host for domain fronting)
+		ips, err := t.dnsCache.ResolveAllSorted(ctx, connectHost)
 		if err != nil {
 			return nil, NewDNSError(host, err)
 		}
@@ -368,6 +396,28 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 		dialer := &net.Dialer{
 			Timeout:   t.connectTimeout,
 			KeepAlive: 30 * time.Second,
+		}
+		if t.localAddr != "" {
+			localIP := net.ParseIP(t.localAddr)
+			dialer.LocalAddr = &net.TCPAddr{IP: localIP}
+			// Filter IPs to match local address family
+			if localIP != nil {
+				isLocalIPv6 := localIP.To4() == nil
+				var filtered []net.IP
+				for _, ip := range ips {
+					if (ip.To4() == nil) == isLocalIPv6 {
+						filtered = append(filtered, ip)
+					}
+				}
+				ips = filtered
+				if len(ips) == 0 {
+					family := "IPv4"
+					if isLocalIPv6 {
+						family = "IPv6"
+					}
+					return nil, NewDNSError(host, fmt.Errorf("no %s addresses found for host (local address is %s)", family, t.localAddr))
+				}
+			}
 		}
 
 		// Try each IP address in order (preferred first based on PreferIPv4 setting)
@@ -411,6 +461,14 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 
 	// For HTTPS, wrap with uTLS
 	if scheme == "https" {
+		// Determine key log writer - config override or global
+		var keyLogWriter io.Writer
+		if t.config != nil && t.config.KeyLogWriter != nil {
+			keyLogWriter = t.config.KeyLogWriter
+		} else {
+			keyLogWriter = GetKeyLogWriter()
+		}
+
 		tlsConfig := &utls.Config{
 			ServerName:                         host,
 			InsecureSkipVerify:                 t.insecureSkipVerify,
@@ -419,6 +477,7 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 			ClientSessionCache:                 t.sessionCache,
 			NextProtos:                         []string{"http/1.1"}, // Force HTTP/1.1 only
 			PreferSkipResumptionOnNilExtension: true,                 // Skip resumption if spec has no PSK extension
+			KeyLogWriter:                       keyLogWriter,
 		}
 
 		// For HTTP/1.1 transport, use ClientHelloID directly
@@ -443,7 +502,40 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			rawConn.Close()
-			return nil, NewTLSError("tls_handshake", host, port, "h1", err)
+
+			// Speculative TLS fallback: if the proxy can't handle combined
+			// CONNECT+ClientHello, re-dial with blocking CONNECT flow.
+			if IsSpeculativeTLSError(err) && t.proxy != nil && t.proxy.URL != "" {
+				MarkProxyNoSpeculative(t.proxy.URL)
+
+				rawConn, dialErr := t.dialHTTPProxyBlockingFresh(ctx, connectHost, port)
+				if dialErr != nil {
+					return nil, NewTLSError("speculative_fallback_dial", host, port, "h1", dialErr)
+				}
+
+				// Redo TLS setup on the clean connection
+				tlsConn = utls.UClient(rawConn, tlsConfig, t.preset.ClientHelloID)
+				tlsConn.SetSessionCache(t.sessionCache)
+				if buildErr := tlsConn.BuildHandshakeState(); buildErr != nil {
+					rawConn.Close()
+					return nil, NewTLSError("build_handshake", host, port, "h1", buildErr)
+				}
+				for _, ext := range tlsConn.Extensions {
+					if alpn, ok := ext.(*utls.ALPNExtension); ok {
+						alpn.AlpnProtocols = []string{"http/1.1"}
+						break
+					}
+				}
+				if hsErr := tlsConn.HandshakeContext(ctx); hsErr != nil {
+					rawConn.Close()
+					return nil, NewTLSError("tls_handshake", host, port, "h1", hsErr)
+				}
+
+				// Update conn to use new rawConn
+				conn.conn = rawConn
+			} else {
+				return nil, NewTLSError("tls_handshake", host, port, "h1", err)
+			}
 		}
 
 		conn.tlsConn = tlsConn
@@ -476,6 +568,9 @@ func (t *HTTP1Transport) dialThroughSOCKS5(ctx context.Context, targetHost, targ
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
 	}
+	if t.localAddr != "" {
+		socks5Dialer.SetLocalAddr(t.localAddr)
+	}
 
 	targetAddr := net.JoinHostPort(targetHost, targetPort)
 	conn, err := socks5Dialer.DialContext(ctx, "tcp", targetAddr)
@@ -486,7 +581,9 @@ func (t *HTTP1Transport) dialThroughSOCKS5(ctx context.Context, targetHost, targ
 	return conn, nil
 }
 
-// dialThroughHTTPProxy establishes a connection through an HTTP proxy using CONNECT
+// dialThroughHTTPProxy establishes a connection through an HTTP proxy using CONNECT.
+// By default, uses speculative TLS: sends CONNECT + ClientHello together to save one round-trip.
+// Can be disabled via TransportConfig.DisableSpeculativeTLS.
 func (t *HTTP1Transport) dialThroughHTTPProxy(ctx context.Context, targetHost, targetPort string) (net.Conn, error) {
 	proxyURL, err := url.Parse(t.proxy.URL)
 	if err != nil {
@@ -518,6 +615,9 @@ func (t *HTTP1Transport) dialThroughHTTPProxy(ctx context.Context, targetHost, t
 		Timeout:   t.connectTimeout,
 		KeepAlive: 30 * time.Second,
 	}
+	if t.localAddr != "" {
+		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(t.localAddr)}
+	}
 
 	// Dial using resolved IP to avoid DNS lookup in net.Dialer
 	proxyAddr := net.JoinHostPort(proxyIPs[0], proxyPort)
@@ -526,7 +626,7 @@ func (t *HTTP1Transport) dialThroughHTTPProxy(ctx context.Context, targetHost, t
 		return nil, fmt.Errorf("failed to connect to proxy: %w", err)
 	}
 
-	// Send CONNECT request
+	// Build CONNECT request
 	targetAddr := net.JoinHostPort(targetHost, targetPort)
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", targetAddr, targetAddr)
 
@@ -538,14 +638,85 @@ func (t *HTTP1Transport) dialThroughHTTPProxy(ctx context.Context, targetHost, t
 
 	connectReq += "Connection: keep-alive\r\n\r\n"
 
-	if _, err := conn.Write([]byte(connectReq)); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to send CONNECT: %w", err)
+	// Check if speculative TLS is disabled (explicitly or via blocklist)
+	if (t.config != nil && t.config.DisableSpeculativeTLS) || IsProxyNoSpeculative(proxyAddr) {
+		// Traditional flow: send CONNECT, wait for 200 OK, then return conn for TLS
+		return t.dialHTTPProxyBlocking(conn, connectReq)
 	}
 
-	// Read response
+	// Speculative TLS: return a SpeculativeConn that will send CONNECT + ClientHello together
+	// This saves one round-trip by overlapping the CONNECT wait with TLS handshake start
+	return NewSpeculativeConn(conn, connectReq), nil
+}
+
+// dialHTTPProxyBlockingFresh opens a new TCP connection to the proxy and performs
+// the traditional blocking CONNECT flow. Used as fallback when speculative TLS fails
+// and the original connection is corrupted.
+func (t *HTTP1Transport) dialHTTPProxyBlockingFresh(ctx context.Context, targetHost, targetPort string) (net.Conn, error) {
+	proxyURL, err := url.Parse(t.proxy.URL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy URL: %w", err)
+	}
+
+	proxyHost := proxyURL.Hostname()
+	proxyPort := proxyURL.Port()
+	if proxyPort == "" {
+		if proxyURL.Scheme == "https" {
+			proxyPort = "443"
+		} else {
+			proxyPort = "8080"
+		}
+	}
+
+	resolver := &net.Resolver{PreferGo: false}
+	proxyIPs, err := resolver.LookupHost(ctx, proxyHost)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve proxy host %s: %w", proxyHost, err)
+	}
+	if len(proxyIPs) == 0 {
+		return nil, fmt.Errorf("no IP addresses found for proxy host %s", proxyHost)
+	}
+
+	dialer := &net.Dialer{
+		Timeout:   t.connectTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+	if t.localAddr != "" {
+		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(t.localAddr)}
+	}
+
+	proxyAddr := net.JoinHostPort(proxyIPs[0], proxyPort)
+	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to proxy: %w", err)
+	}
+
+	targetAddr := net.JoinHostPort(targetHost, targetPort)
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", targetAddr, targetAddr)
+
+	proxyAuth := t.getProxyAuth(proxyURL)
+	if proxyAuth != "" {
+		connectReq += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", proxyAuth)
+	}
+	connectReq += "Connection: keep-alive\r\n\r\n"
+
+	return t.dialHTTPProxyBlocking(conn, connectReq)
+}
+
+// dialHTTPProxyBlocking performs the traditional blocking CONNECT flow.
+// Used when speculative TLS is disabled or as a fallback.
+func (t *HTTP1Transport) dialHTTPProxyBlocking(conn net.Conn, connectReq string) (net.Conn, error) {
+	// Send CONNECT request
+	if _, err := conn.Write([]byte(connectReq)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to send CONNECT request: %w", err)
+	}
+
+	// Set deadline for proxy response to prevent blocking forever
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, nil)
+	conn.SetReadDeadline(time.Time{}) // Clear deadline after response
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to read CONNECT response: %w", err)
@@ -594,8 +765,11 @@ func (t *HTTP1Transport) doRequest(conn *http1Conn, req *http.Request) (*http.Re
 	conn.lastUsedAt = time.Now()
 	conn.useCount++
 
-	// Set deadline
+	// Set deadline - use the earlier of context deadline and response timeout
 	deadline := time.Now().Add(t.responseTimeout)
+	if ctxDeadline, ok := req.Context().Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
 	conn.conn.SetDeadline(deadline)
 	defer conn.conn.SetDeadline(time.Time{})
 

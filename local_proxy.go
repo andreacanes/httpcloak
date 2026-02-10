@@ -596,6 +596,12 @@ func (p *LocalProxy) handleHTTPWithSession(ctx context.Context, clientConn net.C
 		}
 	}
 
+	// Extract per-request TLS-only mode override
+	var tlsOnlyOverride *bool
+	if tlsOnlyValue, hasTLSOnlyHeader := p.extractTLSOnly(req); hasTLSOnlyHeader {
+		tlsOnlyOverride = &tlsOnlyValue
+	}
+
 	// Build headers map (skip hop-by-hop and internal headers)
 	headers := make(map[string][]string)
 	for key, values := range req.Header {
@@ -619,12 +625,13 @@ func (p *LocalProxy) handleHTTPWithSession(ctx context.Context, clientConn net.C
 		headers[key] = values
 	}
 
-	// Build httpcloak request
+	// Build httpcloak request with per-request TLS-only override
 	hcReq := &Request{
 		Method:  req.Method,
 		URL:     targetURL,
 		Headers: headers,
-		Body:    req.Body, // Streaming request body
+		Body:    req.Body,    // Streaming request body
+		TLSOnly: tlsOnlyOverride,
 	}
 
 	// Execute request with fingerprinting
