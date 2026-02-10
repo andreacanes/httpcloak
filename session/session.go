@@ -165,10 +165,10 @@ func NewSessionWithOptions(id string, config *protocol.SessionConfig, opts *Sess
 		}
 	}
 
-	// Disable ECH lookup for faster first request
-	if config.DisableECH {
-		t.SetDisableECH(true)
-	}
+	// Always disable ECH lookup — DNS HTTPS record queries are slow/unsupported
+	// on many resolvers (especially via proxy) and consume context timeout budget.
+	// The Node.js binding doesn't expose disableEch, so force it here.
+	t.SetDisableECH(true)
 
 	// Parse switch protocol if configured
 	switchProto := transport.ProtocolAuto
