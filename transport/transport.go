@@ -913,7 +913,11 @@ func (t *Transport) raceH3H2(ctx context.Context, req *Request) (*Response, Prot
 	go func() {
 		// Give both a chance to connect (with H3 timeout being the limiting factor)
 		// H3 typically times out in 5s if blocked, H2 connects in <1s
-		time.Sleep(6 * time.Second)
+		// Use context-aware wait so we don't outlive the parent context
+		select {
+		case <-time.After(6 * time.Second):
+		case <-raceCtx.Done():
+		}
 		close(doneCh)
 	}()
 
