@@ -1,0 +1,37 @@
+name: Build Windows DLL
+
+on:
+  push:
+    branches: [main, build-*]
+  workflow_dispatch:
+
+jobs:
+  build-windows-dll:
+    name: Build Windows DLL
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build native library
+        shell: bash
+        run: |
+          cd bindings/clib
+          mkdir -p dist
+          CGO_ENABLED=1 go build -buildmode=c-shared -ldflags="-s -w" -o dist/libhttpcloak-windows-amd64.dll httpcloak.go
+          ls -la dist/
+
+      - name: Show build info
+        shell: bash
+        run: |
+          go version -m bindings/clib/dist/libhttpcloak-windows-amd64.dll
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: httpcloak-windows-dll
+          path: bindings/clib/dist/libhttpcloak-windows-amd64.dll
