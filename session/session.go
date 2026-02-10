@@ -264,6 +264,18 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 	requestPath := extractPath(req.URL)
 	requestSecure := isSecureURL(req.URL)
 
+	// Buffer streaming body so it can be replayed on protocol fallback (H2→H1)
+	// and session-level retries. io.Reader is one-shot; req.Body ([]byte) is replayable
+	// because doHTTP1/doHTTP2 wrap it in bytes.NewReader() each time.
+	if req.BodyReader != nil {
+		body, err := io.ReadAll(req.BodyReader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to buffer request body: %w", err)
+		}
+		req.Body = body
+		req.BodyReader = nil
+	}
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		// Add session cookies to request headers BEFORE each attempt
 		// Use domain/path matching to only send relevant cookies

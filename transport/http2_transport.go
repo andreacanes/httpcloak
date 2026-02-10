@@ -218,8 +218,6 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 }
 
 // isConnUsable checks if a connection is still usable
-// Note: We don't check CanTakeNewRequest() here because it can return false
-// even when the connection is fine. We'll handle errors during actual use.
 func (t *HTTP2Transport) isConnUsable(conn *persistentConn) bool {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
@@ -234,8 +232,18 @@ func (t *HTTP2Transport) isConnUsable(conn *persistentConn) bool {
 		return false
 	}
 
-	// Just check if connection object exists - we'll handle errors during RoundTrip
+	// Check if connection object exists
 	if conn.h2Conn == nil {
+		return false
+	}
+
+	// Check if H2 connection can still accept requests.
+	// Detects GOAWAY, dead connections from proxy tunnel closures
+	// (e.g. after server sends Connection: close to MITM proxy),
+	// and exhausted stream limits.
+	// Without this check, RoundTrip on a dead connection hangs for
+	// the full transport timeout (~30s) before failing.
+	if !conn.h2Conn.CanTakeNewRequest() {
 		return false
 	}
 
