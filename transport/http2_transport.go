@@ -615,9 +615,18 @@ func (c *persistentConn) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Close the HTTP/2 client connection first — this sends a GOAWAY frame
-	// and terminates the internal readLoop goroutine. Without this, the
-	// readLoop blocks for ~60s waiting for the dead TCP connection to time out.
+	// Force-expire any pending reads on the TLS connection FIRST.
+	// The h2 readLoop goroutine is blocked on cc.fr.ReadFrame() which
+	// does a blocking TCP read. Setting an immediate deadline causes
+	// ReadFrame() to return with a deadline error right away, instead
+	// of lingering ~60s waiting for the TCP timeout through the proxy.
+	if c.tlsConn != nil {
+		c.tlsConn.SetDeadline(time.Now())
+	}
+
+	// Now close the HTTP/2 client connection — sends GOAWAY, aborts
+	// streams, and calls closeConn(). The readLoop should already be
+	// unblocked from the deadline above.
 	if c.h2Conn != nil {
 		closeWithTimeout(c.h2Conn, 3*time.Second)
 	}
