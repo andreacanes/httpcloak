@@ -5,6 +5,7 @@ import (
 	crand "crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/url"
@@ -1073,38 +1074,37 @@ func (t *HTTP3Transport) GetRequestCount() int64 {
 
 // Close shuts down the transport and all connections
 func (t *HTTP3Transport) Close() error {
-	var errs []error
+	// Use timeout for QUIC closes to prevent blocking on graceful drain
+	closeWithTimeout(t.transport, 3*time.Second)
 
-	// Close HTTP/3 transport
-	if err := t.transport.Close(); err != nil {
-		errs = append(errs, err)
-	}
-
-	// Close QUIC transport if using proxy
 	if t.quicTransport != nil {
-		if err := t.quicTransport.Close(); err != nil {
-			errs = append(errs, err)
-		}
+		closeWithTimeout(t.quicTransport, 3*time.Second)
 	}
 
 	// Close SOCKS5 UDP connection if using proxy
 	if t.socks5Conn != nil {
-		if err := t.socks5Conn.Close(); err != nil {
-			errs = append(errs, err)
-		}
+		t.socks5Conn.Close()
 	}
 
 	// Close MASQUE connection if using MASQUE proxy
 	if t.masqueConn != nil {
-		if err := t.masqueConn.Close(); err != nil {
-			errs = append(errs, err)
-		}
+		t.masqueConn.Close()
 	}
 
-	if len(errs) > 0 {
-		return errs[0]
-	}
 	return nil
+}
+
+// closeWithTimeout calls Close() with a timeout to prevent blocking on QUIC graceful drain.
+func closeWithTimeout(c io.Closer, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		c.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
 }
 
 // Refresh closes all QUIC connections but keeps the TLS session cache intact.
@@ -1113,14 +1113,14 @@ func (t *HTTP3Transport) Refresh() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Close the current transport (this closes all QUIC connections)
+	// Close the current transport with timeout to prevent blocking on QUIC drain
 	if t.transport != nil {
-		t.transport.Close()
+		closeWithTimeout(t.transport, 3*time.Second)
 	}
 
 	// Close and recreate quicTransport if it exists (for direct connections)
 	if t.quicTransport != nil && t.socks5Conn == nil && t.masqueConn == nil {
-		t.quicTransport.Close()
+		closeWithTimeout(t.quicTransport, 3*time.Second)
 		// Create new UDP socket
 		udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 		if err != nil {
