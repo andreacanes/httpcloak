@@ -279,6 +279,7 @@ type SessionConfig struct {
 	DisableECH            bool              `json:"disable_ech,omitempty"`             // Disable ECH lookup for faster first request
 	DisableSpeculativeTLS bool              `json:"disable_speculative_tls,omitempty"` // Disable speculative TLS optimization for proxy connections
 	SwitchProtocol        string            `json:"switch_protocol,omitempty"`         // Protocol to switch to after Refresh()
+	WithoutCookieJar      bool              `json:"without_cookie_jar,omitempty"`      // Disable internal cookie jar (caller manages cookies)
 }
 
 // Error response
@@ -990,6 +991,11 @@ func httpcloak_session_new(configJSON *C.char) C.int64_t {
 	// Handle switch protocol
 	if config.SwitchProtocol != "" {
 		opts = append(opts, httpcloak.WithSwitchProtocol(config.SwitchProtocol))
+	}
+
+	// Handle cookie jar disabling
+	if config.WithoutCookieJar {
+		opts = append(opts, httpcloak.WithoutCookieJar())
 	}
 
 	// Handle session cache if configured globally

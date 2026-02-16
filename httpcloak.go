@@ -318,6 +318,9 @@ type sessionConfig struct {
 	disableSpeculativeTLS bool   // Disable speculative TLS optimization for proxy connections
 	switchProtocol        string // Protocol to switch to after Refresh() (e.g. "h1", "h2", "h3")
 
+	// Disable internal cookie jar (caller manages cookies via headers)
+	withoutCookieJar bool
+
 	// Distributed session cache
 	sessionCacheBackend       transport.SessionCacheBackend
 	sessionCacheErrorCallback transport.ErrorCallback
@@ -527,6 +530,16 @@ func WithSessionCache(backend transport.SessionCacheBackend, errorCallback trans
 	}
 }
 
+// WithoutCookieJar disables the session's internal cookie jar.
+// When set, the session will not automatically store Set-Cookie headers from responses
+// or inject cookies into requests. Cookie management is left entirely to the caller
+// via request headers. Useful when the caller maintains its own cookie jar.
+func WithoutCookieJar() SessionOption {
+	return func(c *sessionConfig) {
+		c.withoutCookieJar = true
+	}
+}
+
 // NewSession creates a new persistent session with cookie management
 func NewSession(preset string, opts ...SessionOption) *Session {
 	cfg := &sessionConfig{
@@ -556,6 +569,7 @@ func NewSession(preset string, opts ...SessionOption) *Session {
 		DisableECH:            cfg.disableECH,
 		DisableSpeculativeTLS: cfg.disableSpeculativeTLS,
 		SwitchProtocol:        cfg.switchProtocol,
+		WithoutCookieJar:      cfg.withoutCookieJar,
 	}
 
 	// Retry configuration

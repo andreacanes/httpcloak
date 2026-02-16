@@ -1246,6 +1246,7 @@ class Session {
       keyLogFile = null,
       disableSpeculativeTls = false,
       switchProtocol = null,
+      withoutCookieJar = false,
     } = options;
 
     this._lib = getLib();
@@ -1311,6 +1312,9 @@ class Session {
     }
     if (switchProtocol) {
       config.switch_protocol = switchProtocol;
+    }
+    if (withoutCookieJar) {
+      config.without_cookie_jar = true;
     }
 
     this._handle = this._lib.httpcloak_session_new(JSON.stringify(config));

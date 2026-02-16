@@ -237,6 +237,8 @@ export interface SessionOptions {
   localAddress?: string;
   /** Path to write TLS key log for Wireshark decryption (overrides SSLKEYLOGFILE env var) */
   keyLogFile?: string;
+  /** Disable internal cookie jar - cookies are managed externally via headers (default: false) */
+  withoutCookieJar?: boolean;
 }
 
 export interface RequestOptions {
