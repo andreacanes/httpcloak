@@ -43,7 +43,7 @@ make test-python
 ```python
 from httpcloak import Session
 
-session = Session(preset="chrome-143")
+session = Session(preset="chrome-latest")
 response = session.get("https://example.com")
 print(response.status_code, response.protocol)
 ```
@@ -61,7 +61,7 @@ make test-nodejs
 ```javascript
 const { Session } = require("httpcloak");
 
-const session = new Session({ preset: "chrome-143" });
+const session = new Session({ preset: "chrome-latest" });
 const response = await session.get("https://example.com");
 console.log(response.statusCode, response.protocol);
 ```
@@ -109,7 +109,7 @@ sudo apt install mingw-w64
 
 | Option          | Type   | Default      | Description                                              |
 |-----------------|--------|--------------|----------------------------------------------------------|
-| preset          | string | "chrome-143" | Browser preset to emulate                                |
+| preset          | string | "chrome-latest" | Browser preset to emulate                                |
 | proxy           | string | null         | Proxy URL                                                |
 | timeout         | int    | 30           | Request timeout in seconds                               |
 | httpVersion     | string | "auto"       | HTTP version: "auto", "h1", "h2", "h3"                   |
@@ -132,7 +132,7 @@ sudo apt install mingw-w64
 ```python
 from httpcloak import available_presets
 print(available_presets())
-# ['chrome-143', 'chrome-143-windows', 'chrome-143-linux', ...]
+# ['chrome-146', 'chrome-146-windows', 'chrome-146-linux', 'chrome-145', ...]
 ```
 
 ## License

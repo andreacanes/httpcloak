@@ -51,7 +51,7 @@ class BasicExamples
         Console.WriteLine(new string('-', 50));
 
         // Create a session with Chrome 143 preset
-        using var session = new Session(preset: Presets.Chrome143);
+        using var session = new Session(preset: Presets.Chrome145);
 
         // Make a simple GET request
         var response = session.Get("https://httpbin.org/get");
@@ -69,7 +69,7 @@ class BasicExamples
         Console.WriteLine("\n[Example 2] POST with JSON Body");
         Console.WriteLine(new string('-', 50));
 
-        using var session = new Session(preset: Presets.Chrome143);
+        using var session = new Session(preset: Presets.Chrome145);
 
         // POST with JSON body
         var jsonBody = """{"name": "httpcloak", "version": "1.5.0"}""";
@@ -97,7 +97,7 @@ class BasicExamples
         Console.WriteLine("\n[Example 3] Custom Headers");
         Console.WriteLine(new string('-', 50));
 
-        using var session = new Session(preset: Presets.Chrome143);
+        using var session = new Session(preset: Presets.Chrome145);
 
         var response = session.Get(
             "https://httpbin.org/headers",
@@ -122,7 +122,7 @@ class BasicExamples
         Console.WriteLine("\n[Example 4] Session with Cookies");
         Console.WriteLine(new string('-', 50));
 
-        using var session = new Session(preset: Presets.Chrome143);
+        using var session = new Session(preset: Presets.Chrome145);
 
         // Set a cookie via the server
         session.Get("https://httpbin.org/cookies/set/session_id/abc123");
@@ -147,7 +147,7 @@ class BasicExamples
         Console.WriteLine("\n[Example 5] Async Requests");
         Console.WriteLine(new string('-', 50));
 
-        using var session = new Session(preset: Presets.Chrome143);
+        using var session = new Session(preset: Presets.Chrome145);
 
         // Single async request
         var response = await session.GetAsync("https://httpbin.org/get");
@@ -173,7 +173,7 @@ class BasicExamples
         Console.WriteLine("\n[Example 6] Error Handling");
         Console.WriteLine(new string('-', 50));
 
-        using var session = new Session(preset: Presets.Chrome143);
+        using var session = new Session(preset: Presets.Chrome145);
 
         // 404 response
         var response = session.Get("https://httpbin.org/status/404");
@@ -200,9 +200,9 @@ class BasicExamples
 
         var presets = new[]
         {
-            Presets.Chrome143,
-            Presets.Chrome143Windows,
-            Presets.Chrome143Linux,
+            Presets.Chrome145,
+            Presets.Chrome145Windows,
+            Presets.Chrome145Linux,
             Presets.Firefox133,
             Presets.Safari18
         };
@@ -226,7 +226,7 @@ class BasicExamples
         Console.WriteLine("\n[Example 8] Header Order Customization");
         Console.WriteLine(new string('-', 50));
 
-        using var session = new Session(preset: Presets.Chrome143);
+        using var session = new Session(preset: Presets.Chrome145);
 
         // Get default header order from preset
         var defaultOrder = session.GetHeaderOrder();

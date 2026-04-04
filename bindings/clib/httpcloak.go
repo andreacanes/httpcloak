@@ -277,9 +277,17 @@ type SessionConfig struct {
 	LocalAddress    string            `json:"local_address,omitempty"`     // Local IP to bind outgoing connections (IPv6 rotation)
 	KeyLogFile      string            `json:"key_log_file,omitempty"`      // Path to write TLS key log for Wireshark decryption
 	DisableECH            bool              `json:"disable_ech,omitempty"`             // Disable ECH lookup for faster first request
-	DisableSpeculativeTLS bool              `json:"disable_speculative_tls,omitempty"` // Disable speculative TLS optimization for proxy connections
+	EnableSpeculativeTLS bool              `json:"enable_speculative_tls,omitempty"` // Enable speculative TLS optimization for proxy connections
 	SwitchProtocol        string            `json:"switch_protocol,omitempty"`         // Protocol to switch to after Refresh()
 	WithoutCookieJar      bool              `json:"without_cookie_jar,omitempty"`      // Disable internal cookie jar (caller manages cookies)
+	JA3               string                 `json:"ja3,omitempty"`                    // Custom JA3 fingerprint string
+	Akamai            string                 `json:"akamai,omitempty"`                 // Custom Akamai HTTP/2 fingerprint string
+	ExtraFP           map[string]interface{} `json:"extra_fp,omitempty"`               // Extra fingerprint options
+	TCPTTL            *int                   `json:"tcp_ttl,omitempty"`                // Override TCP/IP TTL (128=Windows, 64=Linux/macOS)
+	TCPMSS            *int                   `json:"tcp_mss,omitempty"`                // Override TCP MSS (1460=Ethernet)
+	TCPWindowSize     *int                   `json:"tcp_window_size,omitempty"`        // Override TCP window size (64240=Windows, 65535=Linux)
+	TCPWindowScale    *int                   `json:"tcp_window_scale,omitempty"`       // Override TCP window scale (8=Win, 7=Linux, 6=macOS)
+	TCPDFBit          *bool                  `json:"tcp_df,omitempty"`                 // Override IP Don't Fragment flag
 }
 
 // Error response
@@ -867,7 +875,7 @@ func httpcloak_request_raw(handle C.int64_t, requestJSON *C.char, body *C.char, 
 //export httpcloak_session_new
 func httpcloak_session_new(configJSON *C.char) C.int64_t {
 	config := SessionConfig{
-		Preset:      "chrome-144",
+		Preset:      "chrome-146",
 		Timeout:     30,
 		HTTPVersion: "auto",
 	}
@@ -983,9 +991,9 @@ func httpcloak_session_new(configJSON *C.char) C.int64_t {
 		opts = append(opts, httpcloak.WithDisableECH())
 	}
 
-	// Handle speculative TLS disabling
-	if config.DisableSpeculativeTLS {
-		opts = append(opts, httpcloak.WithDisableSpeculativeTLS())
+	// Handle speculative TLS enabling
+	if config.EnableSpeculativeTLS {
+		opts = append(opts, httpcloak.WithEnableSpeculativeTLS())
 	}
 
 	// Handle switch protocol
@@ -996,6 +1004,71 @@ func httpcloak_session_new(configJSON *C.char) C.int64_t {
 	// Handle cookie jar disabling
 	if config.WithoutCookieJar {
 		opts = append(opts, httpcloak.WithoutCookieJar())
+	}
+
+	// Handle custom fingerprint (JA3 / Akamai / extra_fp)
+	if config.JA3 != "" || config.Akamai != "" || len(config.ExtraFP) > 0 {
+		fp := httpcloak.CustomFingerprint{
+			JA3:    config.JA3,
+			Akamai: config.Akamai,
+		}
+		// Map extra_fp keys to CustomFingerprint fields
+		if config.ExtraFP != nil {
+			if v, ok := config.ExtraFP["tls_alpn"]; ok {
+				if arr, ok := v.([]interface{}); ok {
+					for _, item := range arr {
+						if s, ok := item.(string); ok {
+							fp.ALPN = append(fp.ALPN, s)
+						}
+					}
+				}
+			}
+			if v, ok := config.ExtraFP["tls_signature_algorithms"]; ok {
+				if arr, ok := v.([]interface{}); ok {
+					for _, item := range arr {
+						if s, ok := item.(string); ok {
+							fp.SignatureAlgorithms = append(fp.SignatureAlgorithms, s)
+						}
+					}
+				}
+			}
+			if v, ok := config.ExtraFP["tls_cert_compression"]; ok {
+				if arr, ok := v.([]interface{}); ok {
+					for _, item := range arr {
+						if s, ok := item.(string); ok {
+							fp.CertCompression = append(fp.CertCompression, s)
+						}
+					}
+				}
+			}
+			if v, ok := config.ExtraFP["tls_permute_extensions"]; ok {
+				if b, ok := v.(bool); ok {
+					fp.PermuteExtensions = b
+				}
+			}
+		}
+		opts = append(opts, httpcloak.WithCustomFingerprint(fp))
+	}
+
+	// Handle TCP/IP fingerprint overrides
+	if config.TCPTTL != nil || config.TCPMSS != nil || config.TCPWindowSize != nil || config.TCPWindowScale != nil || config.TCPDFBit != nil {
+		tcpFP := fingerprint.TCPFingerprint{}
+		if config.TCPTTL != nil {
+			tcpFP.TTL = *config.TCPTTL
+		}
+		if config.TCPMSS != nil {
+			tcpFP.MSS = *config.TCPMSS
+		}
+		if config.TCPWindowSize != nil {
+			tcpFP.WindowSize = *config.TCPWindowSize
+		}
+		if config.TCPWindowScale != nil {
+			tcpFP.WindowScale = *config.TCPWindowScale
+		}
+		if config.TCPDFBit != nil {
+			tcpFP.DFBit = *config.TCPDFBit
+		}
+		opts = append(opts, httpcloak.WithTCPFingerprint(tcpFP))
 	}
 
 	// Handle session cache if configured globally
@@ -1605,19 +1678,82 @@ func httpcloak_get_cookies(handle C.int64_t) *C.char {
 		return makeErrorJSON(ErrInvalidSession)
 	}
 
-	cookies := session.GetCookies()
+	cookieStates := session.GetCookies()
+	// Convert to clib Cookie format with RFC1123 expires string
+	var cookies []Cookie
+	for _, c := range cookieStates {
+		cookie := Cookie{
+			Name:     c.Name,
+			Value:    c.Value,
+			Domain:   c.Domain,
+			Path:     c.Path,
+			MaxAge:   c.MaxAge,
+			Secure:   c.Secure,
+			HttpOnly: c.HttpOnly,
+			SameSite: c.SameSite,
+		}
+		if c.Expires != nil {
+			cookie.Expires = c.Expires.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+		}
+		cookies = append(cookies, cookie)
+	}
+	if cookies == nil {
+		cookies = []Cookie{}
+	}
 	data, _ := json.Marshal(cookies)
 	return C.CString(string(data))
 }
 
 //export httpcloak_set_cookie
-func httpcloak_set_cookie(handle C.int64_t, name *C.char, value *C.char) {
+func httpcloak_set_cookie(handle C.int64_t, cookieJSON *C.char) {
 	session := getSession(handle)
 	if session == nil {
 		return
 	}
 
-	session.SetCookie(C.GoString(name), C.GoString(value))
+	var cookie Cookie
+	if err := json.Unmarshal([]byte(C.GoString(cookieJSON)), &cookie); err != nil {
+		return
+	}
+
+	var expires *time.Time
+	if cookie.Expires != "" {
+		if t, err := time.Parse("Mon, 02 Jan 2006 15:04:05 GMT", cookie.Expires); err == nil {
+			expires = &t
+		}
+	}
+
+	session.SetCookie(httpcloak.CookieInfo{
+		Name:     cookie.Name,
+		Value:    cookie.Value,
+		Domain:   cookie.Domain,
+		Path:     cookie.Path,
+		MaxAge:   cookie.MaxAge,
+		Secure:   cookie.Secure,
+		HttpOnly: cookie.HttpOnly,
+		SameSite: cookie.SameSite,
+		Expires:  expires,
+	})
+}
+
+//export httpcloak_delete_cookie
+func httpcloak_delete_cookie(handle C.int64_t, name *C.char, domain *C.char) {
+	session := getSession(handle)
+	if session == nil {
+		return
+	}
+
+	session.DeleteCookie(C.GoString(name), C.GoString(domain))
+}
+
+//export httpcloak_clear_cookies
+func httpcloak_clear_cookies(handle C.int64_t) {
+	session := getSession(handle)
+	if session == nil {
+		return
+	}
+
+	session.ClearCookies()
 }
 
 // ============================================================================
@@ -1832,7 +1968,7 @@ func httpcloak_free_string(str *C.char) {
 
 //export httpcloak_version
 func httpcloak_version() *C.char {
-	return C.CString("1.6.0-beta.13")
+	return C.CString("1.6.1")
 }
 
 //export httpcloak_available_presets
@@ -2506,7 +2642,7 @@ type LocalProxyConfig struct {
 func httpcloak_local_proxy_start(configJSON *C.char) C.int64_t {
 	config := LocalProxyConfig{
 		Port:           0,
-		Preset:         "chrome-144",
+		Preset:         "chrome-146",
 		Timeout:        30,
 		MaxConnections: 1000,
 	}

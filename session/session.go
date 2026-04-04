@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +39,21 @@ type SessionOptions struct {
 
 	// SessionCacheErrorCallback is called when backend operations fail
 	SessionCacheErrorCallback transport.ErrorCallback
+
+	// CustomJA3 is a JA3 fingerprint string for custom TLS fingerprinting
+	CustomJA3 string
+
+	// CustomJA3Extras provides extension data that JA3 cannot capture
+	CustomJA3Extras *fingerprint.JA3Extras
+
+	// CustomH2Settings overrides the preset's HTTP/2 settings (from Akamai fingerprint)
+	CustomH2Settings *fingerprint.HTTP2Settings
+
+	// CustomPseudoOrder overrides the pseudo-header order (from Akamai fingerprint)
+	CustomPseudoOrder []string
+
+	// CustomTCPFingerprint overrides individual TCP/IP fingerprint fields from the preset
+	CustomTCPFingerprint *fingerprint.TCPFingerprint
 }
 
 // cacheEntry stores cache validation headers for a URL
@@ -114,8 +130,8 @@ func NewSessionWithOptions(id string, config *protocol.SessionConfig, opts *Sess
 
 	// Create transport config with ConnectTo, ECH, TLS-only, QUIC timeout, localAddr, and session cache settings
 	var transportConfig *transport.TransportConfig
-	needsConfig := len(config.ConnectTo) > 0 || config.ECHConfigDomain != "" || config.TLSOnly || config.QuicIdleTimeout > 0 || config.LocalAddress != "" || keyLogWriter != nil || config.DisableSpeculativeTLS
-	if opts != nil && opts.SessionCacheBackend != nil {
+	needsConfig := len(config.ConnectTo) > 0 || config.ECHConfigDomain != "" || config.TLSOnly || config.QuicIdleTimeout > 0 || config.LocalAddress != "" || keyLogWriter != nil || config.EnableSpeculativeTLS
+	if opts != nil && (opts.SessionCacheBackend != nil || opts.CustomJA3 != "" || opts.CustomH2Settings != nil || len(opts.CustomPseudoOrder) > 0 || opts.CustomTCPFingerprint != nil) {
 		needsConfig = true
 	}
 
@@ -127,12 +143,18 @@ func NewSessionWithOptions(id string, config *protocol.SessionConfig, opts *Sess
 			QuicIdleTimeout:      time.Duration(config.QuicIdleTimeout) * time.Second,
 			LocalAddr:            config.LocalAddress,
 			KeyLogWriter:         keyLogWriter,
-			DisableSpeculativeTLS: config.DisableSpeculativeTLS,
+			EnableSpeculativeTLS: config.EnableSpeculativeTLS,
 		}
 		// Add session cache backend if provided
 		if opts != nil {
 			transportConfig.SessionCacheBackend = opts.SessionCacheBackend
 			transportConfig.SessionCacheErrorCallback = opts.SessionCacheErrorCallback
+			// Add custom fingerprint settings
+			transportConfig.CustomJA3 = opts.CustomJA3
+			transportConfig.CustomJA3Extras = opts.CustomJA3Extras
+			transportConfig.CustomH2Settings = opts.CustomH2Settings
+			transportConfig.CustomPseudoOrder = opts.CustomPseudoOrder
+			transportConfig.CustomTCPFingerprint = opts.CustomTCPFingerprint
 		}
 	}
 
@@ -792,10 +814,12 @@ func (s *Session) getPlatform() platformInfo {
 	} else if contains(presetName, "chrome-141") {
 		info.FullVersionList = `"Google Chrome";v="141.0.7254.112", "Chromium";v="141.0.7254.112", "Not_A Brand";v="24.0.0.0"`
 	} else if contains(presetName, "chrome-143") {
-		info.FullVersionList = `"Google Chrome";v="143.0.7312.86", "Chromium";v="143.0.7312.86", "Not_A Brand";v="24.0.0.0"`
+		info.FullVersionList = `"Google Chrome";v="143.0.7312.86", "Chromium";v="143.0.7312.86", "Not A(Brand";v="24.0.0.0"`
+	} else if contains(presetName, "chrome-144") {
+		info.FullVersionList = `"Not(A:Brand";v="8.0.0.0", "Chromium";v="144.0.7559.132", "Google Chrome";v="144.0.7559.132"`
 	} else {
-		// Default Chrome version
-		info.FullVersionList = `"Google Chrome";v="131.0.6778.86", "Chromium";v="131.0.6778.86", "Not_A Brand";v="24.0.0.0"`
+		// Default: Chrome 145
+		info.FullVersionList = `"Not:A-Brand";v="99.0.0.0", "Google Chrome";v="145.0.7632.75", "Chromium";v="145.0.7632.75"`
 	}
 
 	// Adjust platform-specific values
@@ -1001,26 +1025,32 @@ func (s *Session) Touch() {
 	s.LastUsed = time.Now()
 }
 
-// GetCookies returns all cookies for this session (name -> value)
-// Note: This returns a flat map for backward compatibility. Multiple cookies
-// with the same name from different domains will only show the last one.
-func (s *Session) GetCookies() map[string]string {
+// GetCookies returns all cookies with full metadata
+func (s *Session) GetCookies() []CookieState {
 	return s.cookies.GetAll()
 }
 
-// SetCookie sets a cookie for this session
-// Note: This sets a "global" cookie that will be sent to all domains.
-// For domain-specific cookies, use Set-Cookie headers from responses.
-func (s *Session) SetCookie(name, value string) {
-	s.cookies.SetSimple(name, value)
+// GetCookiesDetailed is an alias for GetCookies, returning full cookie metadata.
+func (s *Session) GetCookiesDetailed() []CookieState {
+	return s.cookies.GetAll()
 }
 
-// SetCookies sets multiple cookies for this session
-// Note: These are "global" cookies that will be sent to all domains.
-func (s *Session) SetCookies(cookies map[string]string) {
-	for k, v := range cookies {
-		s.cookies.SetSimple(k, v)
+// SetCookie sets a cookie with full metadata.
+// If domain is empty, creates a global cookie (sent to all domains).
+func (s *Session) SetCookie(name, value, domain, path string, secure, httpOnly bool, sameSite string, maxAge int, expires *time.Time) {
+	s.cookies.SetSimple(name, value, domain, path, secure, httpOnly, sameSite, maxAge, expires)
+}
+
+// SetCookies sets multiple cookies from CookieState entries
+func (s *Session) SetCookies(cookies []CookieState) {
+	for _, c := range cookies {
+		s.cookies.SetSimple(c.Name, c.Value, c.Domain, c.Path, c.Secure, c.HttpOnly, c.SameSite, c.MaxAge, c.Expires)
 	}
+}
+
+// DeleteCookie removes cookies by name. If domain is empty, removes from all domains.
+func (s *Session) DeleteCookie(name, domain string) {
+	s.cookies.Delete(name, domain)
 }
 
 // ClearCookies removes all cookies from this session
@@ -1382,16 +1412,29 @@ func (s *Session) PostStream(ctx context.Context, url string, body []byte, heade
 
 // resolveURL resolves a possibly relative URL against a base URL (RFC 3986)
 func resolveURL(base, ref string) string {
-	if len(ref) > 7 && (ref[:7] == "http://" || ref[:8] == "https://") {
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
 		return ref
 	}
 	baseURL, err := url.Parse(base)
 	if err != nil {
-		return base + "/" + ref
+		return ref
 	}
 	refURL, err := url.Parse(ref)
 	if err != nil {
-		return base + "/" + ref
+		return ref
+	}
+	// Fix percent-encoded query separators in Location headers.
+	// Some servers send Location: /path%3Ffoo=bar where %3F is meant as
+	// the query separator ?. Go's url.Parse decodes %3F to ? in Path but
+	// keeps RawQuery empty, causing RequestURI() to re-encode ? as %3F.
+	// Browsers treat ? as a query separator regardless of encoding, so
+	// split the path on ? when RawQuery is empty to match browser behavior.
+	if refURL.RawQuery == "" {
+		if idx := strings.IndexByte(refURL.Path, '?'); idx >= 0 {
+			refURL.RawQuery = refURL.Path[idx+1:]
+			refURL.Path = refURL.Path[:idx]
+			refURL.RawPath = ""
+		}
 	}
 	return baseURL.ResolveReference(refURL).String()
 }
@@ -1570,7 +1613,7 @@ func (s *Session) Marshal() ([]byte, error) {
 	config := s.Config
 	if config == nil {
 		config = &protocol.SessionConfig{
-			Preset: "chrome-131",
+			Preset: "chrome-146",
 		}
 	}
 
@@ -1663,7 +1706,7 @@ func UnmarshalSession(data []byte) (*Session, error) {
 	config := state.Config
 	if config == nil {
 		config = &protocol.SessionConfig{
-			Preset: "chrome-131",
+			Preset: "chrome-146",
 		}
 	}
 
@@ -1698,7 +1741,7 @@ func unmarshalSessionV4(data []byte) (*Session, error) {
 	config := state.Config
 	if config == nil {
 		config = &protocol.SessionConfig{
-			Preset: "chrome-131",
+			Preset: "chrome-146",
 		}
 	}
 

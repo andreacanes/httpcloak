@@ -47,19 +47,29 @@ func (s *Session) forkOne() *Session {
 		}
 	}
 
-	// Build transport config (same logic as NewSessionWithOptions, but no keyLogWriter)
+	// Build transport config. If the parent has a transport config (e.g., custom JA3,
+	// H2 settings, speculative TLS), propagate it to the fork. Otherwise fall back to
+	// building from protocol.SessionConfig fields.
 	var transportConfig *transport.TransportConfig
-	needsConfig := len(cfgCopy.ConnectTo) > 0 || cfgCopy.ECHConfigDomain != "" ||
-		cfgCopy.TLSOnly || cfgCopy.QuicIdleTimeout > 0 || cfgCopy.LocalAddress != "" ||
-		cfgCopy.DisableSpeculativeTLS
-	if needsConfig {
-		transportConfig = &transport.TransportConfig{
-			ConnectTo:             cfgCopy.ConnectTo,
-			ECHConfigDomain:       cfgCopy.ECHConfigDomain,
-			TLSOnly:              cfgCopy.TLSOnly,
-			QuicIdleTimeout:      time.Duration(cfgCopy.QuicIdleTimeout) * time.Second,
-			LocalAddr:            cfgCopy.LocalAddress,
-			DisableSpeculativeTLS: cfgCopy.DisableSpeculativeTLS,
+	if parentConfig := s.transport.GetConfig(); parentConfig != nil {
+		// Copy parent's transport config (preserves CustomJA3, CustomH2Settings, etc.)
+		// but clear KeyLogWriter to avoid double-close
+		cfgCopy := *parentConfig
+		cfgCopy.KeyLogWriter = nil
+		transportConfig = &cfgCopy
+	} else {
+		needsConfig := len(cfgCopy.ConnectTo) > 0 || cfgCopy.ECHConfigDomain != "" ||
+			cfgCopy.TLSOnly || cfgCopy.QuicIdleTimeout > 0 || cfgCopy.LocalAddress != "" ||
+			cfgCopy.EnableSpeculativeTLS
+		if needsConfig {
+			transportConfig = &transport.TransportConfig{
+				ConnectTo:             cfgCopy.ConnectTo,
+				ECHConfigDomain:       cfgCopy.ECHConfigDomain,
+				TLSOnly:              cfgCopy.TLSOnly,
+				QuicIdleTimeout:      time.Duration(cfgCopy.QuicIdleTimeout) * time.Second,
+				LocalAddr:            cfgCopy.LocalAddress,
+				EnableSpeculativeTLS: cfgCopy.EnableSpeculativeTLS,
+			}
 		}
 	}
 

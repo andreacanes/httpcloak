@@ -17,7 +17,7 @@ print("Example 1: Configure Global Defaults")
 print("-" * 60)
 
 httpcloak.configure(
-    preset="chrome-143-linux",
+    preset="chrome-latest-linux",
     headers={"Accept-Language": "en-US,en;q=0.9"},
     timeout=30,
 )
@@ -34,10 +34,10 @@ print("Example 2: Different Browser Presets")
 print("-" * 60)
 
 presets = [
+    "chrome-latest",
+    "chrome-latest-windows",
+    "chrome-latest-linux",
     "chrome-143",
-    "chrome-143-windows",
-    "chrome-143-linux",
-    "chrome-131",
     "firefox-133",
     "safari-18",
 ]
@@ -59,7 +59,7 @@ print("-" * 60)
 http_versions = ["auto", "h1", "h2", "h3"]
 
 for version in http_versions:
-    session = httpcloak.Session(preset="chrome-143", http_version=version)
+    session = httpcloak.Session(preset="chrome-latest", http_version=version)
     try:
         r = session.get("https://www.cloudflare.com/cdn-cgi/trace")
         trace = dict(line.split("=", 1) for line in r.text.strip().split("\n") if "=" in line)
@@ -86,7 +86,7 @@ print("\n" + "=" * 60)
 print("Example 5: Header Order Customization")
 print("-" * 60)
 
-session = httpcloak.Session(preset="chrome-143")
+session = httpcloak.Session(preset="chrome-latest")
 
 # Get default header order from preset
 default_order = session.get_header_order()

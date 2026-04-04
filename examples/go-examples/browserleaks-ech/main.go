@@ -77,8 +77,8 @@ func main() {
 	}
 
 	// Create client with ECH config and force HTTP/3
-	// Note: chrome-143 has QUICClientHelloID set, chrome-131 doesn't
-	c := client.NewClient("chrome-143",
+	// Note: chrome-latest has QUICClientHelloID set for H3 support
+	c := client.NewClient("chrome-latest",
 		client.WithTimeout(30*time.Second),
 		client.WithECHConfig(echConfig),
 	)

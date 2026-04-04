@@ -38,7 +38,7 @@ print("Example 2: Global Auth Configuration")
 print("-" * 60)
 
 httpcloak.configure(
-    preset="chrome-143",
+    preset="chrome-latest",
     auth=("user", "pass"),
 )
 
@@ -47,7 +47,7 @@ print(f"Status: {r.status_code}")
 print(f"Auth header sent automatically")
 
 # Reset configuration
-httpcloak.configure(preset="chrome-143")
+httpcloak.configure(preset="chrome-latest")
 
 # Timeout configuration
 print("\n" + "=" * 60)
@@ -55,7 +55,7 @@ print("Example 3: Timeout Configuration")
 print("-" * 60)
 
 # Session-level timeout
-session = httpcloak.Session(preset="chrome-143", timeout=10)
+session = httpcloak.Session(preset="chrome-latest", timeout=10)
 
 try:
     # This should complete within timeout
@@ -68,7 +68,7 @@ session.close()
 
 # Per-request timeout
 print("\nPer-request timeout:")
-session = httpcloak.Session(preset="chrome-143", timeout=30)
+session = httpcloak.Session(preset="chrome-latest", timeout=30)
 
 try:
     r = session.get("https://httpbin.org/delay/1", timeout=5)
@@ -102,13 +102,13 @@ print("-" * 60)
 print("""
 # To use a proxy:
 session = httpcloak.Session(
-    preset="chrome-143",
+    preset="chrome-latest",
     proxy="http://user:pass@proxy.example.com:8080"
 )
 
 # Or with configure():
 httpcloak.configure(
-    preset="chrome-143",
+    preset="chrome-latest",
     proxy="socks5://user:pass@proxy.example.com:1080"
 )
 
@@ -118,13 +118,13 @@ httpcloak.configure(
 # - socks5://host:port
 # - socks5://user:pass@host:port
 
-# Speculative TLS optimization (enabled by default):
+# Speculative TLS optimization (disabled by default):
 # Sends CONNECT + TLS ClientHello together, saving one round-trip (~25% faster).
-# If you experience issues with certain proxies, disable it:
+# Enable it for compatible proxies:
 session = httpcloak.Session(
-    preset="chrome-143",
+    preset="chrome-latest",
     proxy="http://user:pass@proxy.example.com:8080",
-    disable_speculative_tls=True
+    enable_speculative_tls=True
 )
 """)
 

@@ -31,7 +31,25 @@ class HTTPCloakError extends Error {
  *   const session = new httpcloak.Session({ preset: httpcloak.Preset.FIREFOX_133 });
  */
 const Preset = {
-  // Chrome 143 (latest)
+  // Chrome 146 (latest)
+  CHROME_146: "chrome-146",
+  CHROME_146_WINDOWS: "chrome-146-windows",
+  CHROME_146_LINUX: "chrome-146-linux",
+  CHROME_146_MACOS: "chrome-146-macos",
+
+  // Chrome 145
+  CHROME_145: "chrome-145",
+  CHROME_145_WINDOWS: "chrome-145-windows",
+  CHROME_145_LINUX: "chrome-145-linux",
+  CHROME_145_MACOS: "chrome-145-macos",
+
+  // Chrome 144
+  CHROME_144: "chrome-144",
+  CHROME_144_WINDOWS: "chrome-144-windows",
+  CHROME_144_LINUX: "chrome-144-linux",
+  CHROME_144_MACOS: "chrome-144-macos",
+
+  // Chrome 143
   CHROME_143: "chrome-143",
   CHROME_143_WINDOWS: "chrome-143-windows",
   CHROME_143_LINUX: "chrome-143-linux",
@@ -44,18 +62,34 @@ const Preset = {
   CHROME_133: "chrome-133",
 
   // Mobile Chrome
-  IOS_CHROME_143: "ios-chrome-143",
-  IOS_CHROME_144: "ios-chrome-144",
-  ANDROID_CHROME_143: "android-chrome-143",
-  ANDROID_CHROME_144: "android-chrome-144",
+  CHROME_143_IOS: "chrome-143-ios",
+  CHROME_144_IOS: "chrome-144-ios",
+  CHROME_145_IOS: "chrome-145-ios",
+  CHROME_146_IOS: "chrome-146-ios",
+  CHROME_143_ANDROID: "chrome-143-android",
+  CHROME_144_ANDROID: "chrome-144-android",
+  CHROME_145_ANDROID: "chrome-145-android",
+  CHROME_146_ANDROID: "chrome-146-android",
 
   // Firefox
   FIREFOX_133: "firefox-133",
 
   // Safari (desktop and mobile)
   SAFARI_18: "safari-18",
-  IOS_SAFARI_17: "ios-safari-17",
-  IOS_SAFARI_18: "ios-safari-18",
+  SAFARI_17_IOS: "safari-17-ios",
+  SAFARI_18_IOS: "safari-18-ios",
+
+  // Backwards compatibility aliases (old naming convention)
+  IOS_CHROME_143: "chrome-143-ios",
+  IOS_CHROME_144: "chrome-144-ios",
+  IOS_CHROME_145: "chrome-145-ios",
+  IOS_CHROME_146: "chrome-146-ios",
+  ANDROID_CHROME_143: "chrome-143-android",
+  ANDROID_CHROME_144: "chrome-144-android",
+  ANDROID_CHROME_145: "chrome-145-android",
+  ANDROID_CHROME_146: "chrome-146-android",
+  IOS_SAFARI_17: "safari-17-ios",
+  IOS_SAFARI_18: "safari-18-ios",
 
   /**
    * Get all available preset names
@@ -63,12 +97,15 @@ const Preset = {
    */
   all() {
     return [
+      this.CHROME_146, this.CHROME_146_WINDOWS, this.CHROME_146_LINUX, this.CHROME_146_MACOS,
+      this.CHROME_145, this.CHROME_145_WINDOWS, this.CHROME_145_LINUX, this.CHROME_145_MACOS,
       this.CHROME_144, this.CHROME_144_WINDOWS, this.CHROME_144_LINUX, this.CHROME_144_MACOS,
       this.CHROME_143, this.CHROME_143_WINDOWS, this.CHROME_143_LINUX, this.CHROME_143_MACOS,
       this.CHROME_141, this.CHROME_133,
-      this.IOS_CHROME_143, this.IOS_CHROME_144, this.ANDROID_CHROME_143, this.ANDROID_CHROME_144,
+      this.CHROME_146_IOS, this.CHROME_145_IOS, this.CHROME_144_IOS, this.CHROME_143_IOS,
+      this.CHROME_146_ANDROID, this.CHROME_145_ANDROID, this.CHROME_144_ANDROID, this.CHROME_143_ANDROID,
       this.FIREFOX_133,
-      this.SAFARI_18, this.IOS_SAFARI_17, this.IOS_SAFARI_18,
+      this.SAFARI_18, this.SAFARI_17_IOS, this.SAFARI_18_IOS,
     ];
   },
 };
@@ -763,7 +800,9 @@ function getLib() {
       httpcloak_post: nativeLibHandle.func("httpcloak_post", "str", ["int64", "str", "str", "str"]),
       httpcloak_request: nativeLibHandle.func("httpcloak_request", "str", ["int64", "str"]),
       httpcloak_get_cookies: nativeLibHandle.func("httpcloak_get_cookies", "str", ["int64"]),
-      httpcloak_set_cookie: nativeLibHandle.func("httpcloak_set_cookie", "void", ["int64", "str", "str"]),
+      httpcloak_set_cookie: nativeLibHandle.func("httpcloak_set_cookie", "void", ["int64", "str"]),
+      httpcloak_delete_cookie: nativeLibHandle.func("httpcloak_delete_cookie", "void", ["int64", "str", "str"]),
+      httpcloak_clear_cookies: nativeLibHandle.func("httpcloak_clear_cookies", "void", ["int64"]),
       httpcloak_free_string: nativeLibHandle.func("httpcloak_free_string", "void", ["void*"]),
       httpcloak_version: nativeLibHandle.func("httpcloak_version", "str", []),
       httpcloak_available_presets: nativeLibHandle.func("httpcloak_available_presets", "str", []),
@@ -998,11 +1037,11 @@ function addParamsToUrl(url, params) {
     return url;
   }
 
-  const urlObj = new URL(url);
-  for (const [key, value] of Object.entries(params)) {
-    urlObj.searchParams.append(key, String(value));
-  }
-  return urlObj.toString();
+  const sep = url.includes('?') ? '&' : '?';
+  const parts = Object.entries(params).map(
+    ([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`
+  );
+  return url + sep + parts.join('&');
 }
 
 /**
@@ -1136,7 +1175,7 @@ function version() {
 /**
  * Get available browser presets with their supported protocols.
  * Returns an object mapping preset names to their info:
- *   { "chrome-144": { protocols: ["h1", "h2", "h3"] }, ... }
+ *   { "chrome-146": { protocols: ["h1", "h2", "h3"] }, ... }
  */
 function availablePresets() {
   const nativeLib = getLib();
@@ -1202,7 +1241,7 @@ class Session {
   /**
    * Create a new session
    * @param {Object} options - Session options
-   * @param {string} [options.preset="chrome-143"] - Browser preset to use
+   * @param {string} [options.preset="chrome-146"] - Browser preset to use
    * @param {string} [options.proxy] - Proxy URL (e.g., "http://user:pass@host:port" or "socks5://host:port")
    * @param {string} [options.tcpProxy] - Proxy URL for TCP protocols (HTTP/1.1, HTTP/2) - use with udpProxy for split config
    * @param {string} [options.udpProxy] - Proxy URL for UDP protocols (HTTP/3 via MASQUE) - use with tcpProxy for split config
@@ -1223,7 +1262,7 @@ class Session {
    */
   constructor(options = {}) {
     const {
-      preset = "chrome-143",
+      preset = "chrome-146",
       proxy = null,
       tcpProxy = null,
       udpProxy = null,
@@ -1244,9 +1283,17 @@ class Session {
       quicIdleTimeout = 0,
       localAddress = null,
       keyLogFile = null,
-      disableSpeculativeTls = false,
+      enableSpeculativeTls = false,
       switchProtocol = null,
       withoutCookieJar = false,
+      ja3 = null,
+      akamai = null,
+      extraFp = null,
+      tcpTtl = null,
+      tcpMss = null,
+      tcpWindowSize = null,
+      tcpWindowScale = null,
+      tcpDf = null,
     } = options;
 
     this._lib = getLib();
@@ -1307,14 +1354,38 @@ class Session {
     if (keyLogFile) {
       config.key_log_file = keyLogFile;
     }
-    if (disableSpeculativeTls) {
-      config.disable_speculative_tls = true;
+    if (enableSpeculativeTls) {
+      config.enable_speculative_tls = true;
     }
     if (switchProtocol) {
       config.switch_protocol = switchProtocol;
     }
     if (withoutCookieJar) {
       config.without_cookie_jar = true;
+    }
+    if (ja3) {
+      config.ja3 = ja3;
+    }
+    if (akamai) {
+      config.akamai = akamai;
+    }
+    if (extraFp) {
+      config.extra_fp = extraFp;
+    }
+    if (tcpTtl != null) {
+      config.tcp_ttl = tcpTtl;
+    }
+    if (tcpMss != null) {
+      config.tcp_mss = tcpMss;
+    }
+    if (tcpWindowSize != null) {
+      config.tcp_window_size = tcpWindowSize;
+    }
+    if (tcpWindowScale != null) {
+      config.tcp_window_scale = tcpWindowScale;
+    }
+    if (tcpDf != null) {
+      config.tcp_df = tcpDf;
     }
 
     this._handle = this._lib.httpcloak_session_new(JSON.stringify(config));
@@ -1821,58 +1892,118 @@ class Session {
   // ===========================================================================
 
   /**
-   * Get all cookies from the session
-   * @returns {Object} Cookies as key-value pairs
+   * Get all cookies with full metadata (domain, path, expiry, flags).
+   * @returns {Cookie[]} Array of Cookie objects
    */
-  getCookies() {
+  getCookiesDetailed() {
     const resultPtr = this._lib.httpcloak_get_cookies(this._handle);
     const result = resultToString(resultPtr);
     if (result) {
-      return JSON.parse(result);
+      const parsed = JSON.parse(result);
+      return parsed.map(c => new Cookie(c));
     }
-    return {};
+    return [];
   }
 
   /**
-   * Get a specific cookie by name
+   * Get all cookies as a flat name-value object.
+   * @deprecated getCookies() will return Cookie[] with full metadata (domain, path, expiry) in a future release.
+   *             Use getCookiesDetailed() if you want the new format now.
+   * @returns {Object} Cookies as key-value pairs
+   */
+  getCookies() {
+    if (!Session._getCookiesDeprecated) {
+      Session._getCookiesDeprecated = true;
+      process.emitWarning(
+        'getCookies() currently returns a flat {name: value} object. In a future release, it will return Cookie[] with full metadata (domain, path, expiry, etc.), same as getCookiesDetailed(). Update your code accordingly.',
+        'DeprecationWarning'
+      );
+    }
+    const cookies = this.getCookiesDetailed();
+    const result = {};
+    for (const c of cookies) {
+      result[c.name] = c.value;
+    }
+    return result;
+  }
+
+  /**
+   * Get a specific cookie by name with full metadata.
+   * @param {string} name - Cookie name
+   * @returns {Cookie|null} Cookie object or null if not found
+   */
+  getCookieDetailed(name) {
+    const cookies = this.getCookiesDetailed();
+    return cookies.find(c => c.name === name) || null;
+  }
+
+  /**
+   * Get a specific cookie value by name.
+   * @deprecated getCookie() will return a Cookie object (with domain, path, expiry) instead of a string in a future release.
+   *             Use getCookieDetailed() if you want the new format now.
    * @param {string} name - Cookie name
    * @returns {string|null} Cookie value or null if not found
    */
   getCookie(name) {
-    const cookies = this.getCookies();
-    return cookies[name] || null;
+    if (!Session._getCookieDeprecated) {
+      Session._getCookieDeprecated = true;
+      process.emitWarning(
+        'getCookie() currently returns a string value. In a future release, it will return a Cookie object with full metadata (domain, path, expiry, etc.), same as getCookieDetailed(). Update your code accordingly.',
+        'DeprecationWarning'
+      );
+    }
+    const cookie = this.getCookieDetailed(name);
+    return cookie ? cookie.value : null;
   }
 
   /**
    * Set a cookie in the session
    * @param {string} name - Cookie name
    * @param {string} value - Cookie value
+   * @param {Object} [options] - Cookie options
+   * @param {string} [options.domain] - Cookie domain
+   * @param {string} [options.path] - Cookie path (default: "/")
+   * @param {boolean} [options.secure] - Secure flag
+   * @param {boolean} [options.httpOnly] - HttpOnly flag
+   * @param {string} [options.sameSite] - SameSite attribute (Strict, Lax, None)
+   * @param {number} [options.maxAge] - Max age in seconds (0 means not set)
+   * @param {string} [options.expires] - Expiration date (RFC1123 format)
    */
-  setCookie(name, value) {
-    this._lib.httpcloak_set_cookie(this._handle, name, value);
+  setCookie(name, value, options = {}) {
+    const cookie = {
+      name,
+      value,
+      domain: options.domain || "",
+      path: options.path || "/",
+      secure: options.secure || false,
+      http_only: options.httpOnly || false,
+      same_site: options.sameSite || "",
+      max_age: options.maxAge || 0,
+      expires: options.expires || "",
+    };
+    this._lib.httpcloak_set_cookie(this._handle, JSON.stringify(cookie));
   }
 
   /**
    * Delete a specific cookie by name
    * @param {string} name - Cookie name to delete
+   * @param {string} [domain] - Domain to delete from (omit to delete from all domains)
    */
-  deleteCookie(name) {
-    // Set cookie to empty value - effectively deletes it
-    this._lib.httpcloak_set_cookie(this._handle, name, "");
+  deleteCookie(name, domain = "") {
+    this._lib.httpcloak_delete_cookie(this._handle, name, domain);
   }
 
   /**
    * Clear all cookies from the session
    */
   clearCookies() {
-    const cookies = this.getCookies();
-    for (const name of Object.keys(cookies)) {
-      this.deleteCookie(name);
-    }
+    this._lib.httpcloak_clear_cookies(this._handle);
   }
 
   /**
-   * Get cookies as a property
+   * Get cookies as a property.
+   * @deprecated This property will return Cookie[] with full metadata in a future release.
+   * @returns {Object} Cookies as key-value pairs
    */
   get cookies() {
     return this.getCookies();
@@ -2043,7 +2174,7 @@ class Session {
    * @param {string} path - Path to save the session file
    *
    * Example:
-   *   const session = new httpcloak.Session({ preset: "chrome-143" });
+   *   const session = new httpcloak.Session({ preset: "chrome-146" });
    *   await session.get("https://example.com");  // Acquire cookies
    *   session.save("session.json");
    *
@@ -2681,7 +2812,7 @@ let _defaultConfig = {};
 /**
  * Configure defaults for module-level functions
  * @param {Object} options - Configuration options
- * @param {string} [options.preset="chrome-143"] - Browser preset
+ * @param {string} [options.preset="chrome-146"] - Browser preset
  * @param {Object} [options.headers] - Default headers
  * @param {Array} [options.auth] - Default basic auth [username, password]
  * @param {string} [options.proxy] - Proxy URL
@@ -2695,7 +2826,7 @@ let _defaultConfig = {};
  */
 function configure(options = {}) {
   const {
-    preset = "chrome-143",
+    preset = "chrome-146",
     headers = null,
     auth = null,
     proxy = null,
@@ -2753,7 +2884,7 @@ function configure(options = {}) {
  */
 function _getDefaultSession() {
   if (!_defaultSession) {
-    const preset = _defaultConfig.preset || "chrome-143";
+    const preset = _defaultConfig.preset || "chrome-146";
     const proxy = _defaultConfig.proxy || null;
     const timeout = _defaultConfig.timeout || 30;
     const httpVersion = _defaultConfig.httpVersion || "auto";
@@ -2856,7 +2987,7 @@ function request(method, url, options = {}) {
  * Without registration, cache callbacks will not be triggered for that session.
  *
  * @example
- * const proxy = new LocalProxy({ preset: "chrome-143", tlsOnly: true });
+ * const proxy = new LocalProxy({ preset: "chrome-146", tlsOnly: true });
  * console.log(`Proxy running on ${proxy.proxyUrl}`);
  *
  * // Use with any HTTP client pointing to the proxy
@@ -2885,7 +3016,7 @@ class LocalProxy {
    * Create and start a local HTTP proxy server.
    * @param {Object} options - Proxy configuration options
    * @param {number} [options.port=0] - Port to listen on (0 = auto-select)
-   * @param {string} [options.preset="chrome-143"] - Browser fingerprint preset
+   * @param {string} [options.preset="chrome-146"] - Browser fingerprint preset
    * @param {number} [options.timeout=30] - Request timeout in seconds
    * @param {number} [options.maxConnections=1000] - Maximum concurrent connections
    * @param {string} [options.tcpProxy] - Default upstream TCP proxy URL
@@ -2895,7 +3026,7 @@ class LocalProxy {
   constructor(options = {}) {
     const {
       port = 0,
-      preset = "chrome-143",
+      preset = "chrome-146",
       timeout = 30,
       maxConnections = 1000,
       tcpProxy = null,

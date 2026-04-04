@@ -17,7 +17,6 @@ import (
 	"github.com/sardanioss/httpcloak/transport"
 	"github.com/sardanioss/quic-go"
 	"github.com/sardanioss/quic-go/http3"
-	"github.com/sardanioss/quic-go/quicvarint"
 	tls "github.com/sardanioss/utls"
 	utls "github.com/sardanioss/utls"
 )
@@ -30,13 +29,6 @@ const (
 	settingH3Datagram            = 0x33
 )
 
-// QUIC Transport Parameter IDs
-const (
-	transportParamVersionInfo  = 0x11   // version_information
-	transportParamGoogleVer    = 0x4752 // google_version (18258)
-	transportParamInitialRTT   = 0x3127 // initial_rtt (12583)
-)
-
 func init() {
 	// Set Chrome-like connection ID length (0 bytes - Chrome sends empty SCID)
 	quic.SetDefaultConnectionIDLength(0)
@@ -44,57 +36,9 @@ func init() {
 	// Set Chrome-like max_datagram_frame_size (65536 vs default 16383)
 	quic.SetMaxDatagramSize(65536)
 
-	// Set additional transport parameters to match Chrome fingerprint
-	quic.SetAdditionalTransportParameters(buildChromeTransportParams())
-}
-
-// buildChromeTransportParams builds Chrome-like QUIC transport parameters
-func buildChromeTransportParams() map[uint64][]byte {
-	params := make(map[uint64][]byte)
-
-	// version_information (0x11): chosen_version=QUICv1, available_versions=[QUICv1, GREASE]
-	// Format: chosen_version (4 bytes) + available_versions_length (varint) + versions...
-	versionInfo := make([]byte, 0, 16)
-	versionInfo = binary.BigEndian.AppendUint32(versionInfo, 0x00000001) // QUICv1 chosen
-	versionInfo = binary.BigEndian.AppendUint32(versionInfo, 0x00000001) // QUICv1 available
-	// Chrome uses consistent GREASE version pattern: 0xdadadada is common
-	versionInfo = binary.BigEndian.AppendUint32(versionInfo, 0xdadadada)
-	params[transportParamVersionInfo] = versionInfo
-
-	// google_version (0x4752): QUICv1
-	googleVer := make([]byte, 4)
-	binary.BigEndian.PutUint32(googleVer, 0x00000001) // QUICv1
-	params[transportParamGoogleVer] = googleVer
-
-	// initial_rtt (12583/0x3127): Chrome typically uses values around 100-300ms
-	// Use a consistent value to avoid fingerprint variation
-	initialRTT := make([]byte, 0, 8)
-	initialRTT = quicvarint.Append(initialRTT, 100000) // 100ms in microseconds
-	params[transportParamInitialRTT] = initialRTT
-
-	// GREASE transport parameter - Chrome uses large random N values
-	// GREASE IDs are of form 27 + 31*N where N is random
-	// Chrome uses values like 25319800860025788 (very large N)
-	greaseID := generateGREASETransportParamID()
-	params[greaseID] = []byte{} // Empty GREASE data is valid and common
-
-	return params
-}
-
-// generateGREASEVersion generates a GREASE version value
-// GREASE versions are of form 0x?a?a?a?a where ? is any hex digit
-func generateGREASEVersion() uint32 {
-	n := rand.Uint32()
-	return (n & 0xf0f0f0f0) | 0x0a0a0a0a
-}
-
-// generateGREASETransportParamID generates a GREASE transport parameter ID
-// GREASE IDs are of form 27 + 31*N for some N
-// Chrome uses very large N values, producing IDs like 25319800860025788
-func generateGREASETransportParamID() uint64 {
-	// Generate large N values similar to Chrome (produces 15-17 digit IDs)
-	n := uint64(100000000000000 + rand.Int63n(900000000000000))
-	return 27 + 31*n
+	// Note: Chrome transport parameters (version_info, google_version, initial_rtt)
+	// are set by transport/http3_transport.go's init() via BuildChromeTransportParams().
+	// GREASE transport param is inserted by quic-go's Chrome-mode marshaling.
 }
 
 // Note: quic-go may print buffer size warnings to stderr. These are informational
@@ -442,6 +386,14 @@ func (p *QUICHostPool) createConn(ctx context.Context) (*QUICConn, error) {
 	port, _ := net.LookupPort("udp", p.port)
 	if port == 0 {
 		port = 443
+	}
+
+	// Measure RTT to target before QUIC dial so initial_rtt matches real latency.
+	// Uses first available IP; runs once per process (cached via rttMeasured flag).
+	if len(ipv6) > 0 {
+		transport.MeasureAndSetInitialRTT(ctx, ipv6[0].String(), port)
+	} else if len(ipv4) > 0 {
+		transport.MeasureAndSetInitialRTT(ctx, ipv4[0].String(), port)
 	}
 
 	// Generate large GREASE setting ID like Chrome (0x1f * N + 0x21 where N is large)

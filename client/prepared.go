@@ -28,6 +28,7 @@ type PreparedRequest struct {
 	ForceProtocol Protocol // Forced protocol
 	FetchMode     FetchMode
 	FetchSite     FetchSite
+	FetchDest     string
 	Referer       string
 	Auth          Auth
 
@@ -144,6 +145,7 @@ func (c *Client) Prepare(ctx context.Context, req *Request) (*PreparedRequest, e
 		ForceProtocol:   req.ForceProtocol,
 		FetchMode:       req.FetchMode,
 		FetchSite:       req.FetchSite,
+		FetchDest:       req.FetchDest,
 		Referer:         req.Referer,
 		Auth:            req.Auth,
 		FollowRedirects: followRedirects,
@@ -239,6 +241,7 @@ func (p *PreparedRequest) Send(ctx context.Context) (*Response, error) {
 		ForceProtocol:   p.ForceProtocol,
 		FetchMode:       p.FetchMode,
 		FetchSite:       p.FetchSite,
+		FetchDest:       p.FetchDest,
 		Referer:         p.Referer,
 		Auth:            p.Auth,
 		FollowRedirects: &p.FollowRedirects,

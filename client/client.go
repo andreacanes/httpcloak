@@ -278,6 +278,13 @@ func (c *Client) SetTimeout(timeout time.Duration) {
 	c.config.Timeout = timeout
 }
 
+// SetForceProtocol changes the protocol for all subsequent requests.
+// Use ProtocolHTTP2 for H2, ProtocolHTTP3 for H3, ProtocolAuto for auto-detect.
+// Added for PX solver: mimics Chrome's H2→H3 alt-svc upgrade pattern.
+func (c *Client) SetForceProtocol(p Protocol) {
+	c.config.ForceProtocol = p
+}
+
 // SetAuth sets authentication for all requests
 func (c *Client) SetAuth(auth Auth) {
 	c.auth = auth
@@ -380,6 +387,7 @@ type FetchMode int
 const (
 	FetchModeNavigate FetchMode = iota // Default: human clicked link (sec-fetch-mode: navigate)
 	FetchModeCORS                      // XHR/fetch call (sec-fetch-mode: cors)
+	FetchModeNoCors                    // Subresource load (script/style/image): sec-fetch-mode: no-cors
 )
 
 // FetchSite specifies the Sec-Fetch-Site value
@@ -404,8 +412,9 @@ type Request struct {
 	// Customization options
 	UserAgent     string    // Override User-Agent (empty = use preset)
 	ForceProtocol Protocol  // Force specific protocol (ProtocolAuto = auto)
-	FetchMode     FetchMode // Fetch mode: Navigate (default, human click) or CORS (XHR/fetch)
+	FetchMode     FetchMode // Fetch mode: Navigate (default, human click) or CORS (XHR/fetch) or NoCors (subresource)
 	FetchSite     FetchSite // Sec-Fetch-Site: Auto (default), None, SameOrigin, SameSite, CrossSite
+	FetchDest     string    // Sec-Fetch-Dest for NoCors mode: "script", "style", "image" (empty = use mode default)
 	Referer       string    // Referer header (used for auto-detecting FetchSite)
 
 	// Authentication (overrides client-level auth)
@@ -1504,6 +1513,8 @@ func applyModeHeaders(httpReq *http.Request, preset *fingerprint.Preset, req *Re
 	// This prevents the "I want JSON but I'm navigating a document" incoherence
 	effectiveMode := req.FetchMode
 	if effectiveMode == FetchModeNavigate {
+		// Auto-detect CORS from Accept header, but only when mode is default Navigate
+		// NoCors mode is explicit and must not be overridden
 		if acceptValues, ok := getHeaderCaseInsensitive(req.Headers, "Accept"); ok && len(acceptValues) > 0 {
 			if isAPIAcceptHeader(acceptValues[0]) {
 				effectiveMode = FetchModeCORS
@@ -1520,6 +1531,8 @@ func applyModeHeaders(httpReq *http.Request, preset *fingerprint.Preset, req *Re
 	switch effectiveMode {
 	case FetchModeCORS:
 		applyCORSModeHeaders(httpReq, preset, req, parsedURL)
+	case FetchModeNoCors:
+		applyNoCorsHeaders(httpReq, preset, req)
 	default:
 		applyNavigationModeHeaders(httpReq, preset, req)
 	}
@@ -1541,12 +1554,12 @@ func applyModeHeaders(httpReq *http.Request, preset *fingerprint.Preset, req *Re
 	}
 
 	// Set header order for HTTP/2 and HTTP/3 fingerprinting
-	// Custom order takes precedence, then preset's order, then fallback to hardcoded default
+	// Custom order takes precedence, then preset's protocol-specific order, then fallback
 	if len(customHeaderOrder) > 0 {
 		// Use custom header order
 		httpReq.Header[http.HeaderOrderKey] = customHeaderOrder
 	} else if len(preset.HeaderOrder) > 0 {
-		// Use preset's header order
+		// Use preset's header order (H2/default)
 		order := make([]string, len(preset.HeaderOrder))
 		for i, hp := range preset.HeaderOrder {
 			order[i] = hp.Key
@@ -1593,7 +1606,6 @@ func isModeCriticalHeader(lowerKey string) bool {
 		"sec-fetch-user":            true,
 		"sec-fetch-site":            true,
 		"upgrade-insecure-requests": true,
-		"cache-control":             true,
 		"origin":                    true,
 	}
 	return critical[lowerKey]
@@ -1670,6 +1682,47 @@ func applyCORSModeHeaders(httpReq *http.Request, preset *fingerprint.Preset, req
 	httpReq.Header.Set("Priority", "u=1, i")
 }
 
+// applyNoCorsHeaders sets headers for subresource loads (script, style, image)
+// These are loaded via <script>, <link>, <img> tags — browser uses sec-fetch-mode: no-cors
+func applyNoCorsHeaders(httpReq *http.Request, preset *fingerprint.Preset, req *Request) {
+	// Client hints (low-entropy only)
+	if v, ok := preset.Headers["sec-ch-ua"]; ok {
+		httpReq.Header.Set("Sec-Ch-Ua", v)
+	}
+	if v, ok := preset.Headers["sec-ch-ua-mobile"]; ok {
+		httpReq.Header.Set("Sec-Ch-Ua-Mobile", v)
+	}
+	if v, ok := preset.Headers["sec-ch-ua-platform"]; ok {
+		httpReq.Header.Set("Sec-Ch-Ua-Platform", v)
+	}
+
+	// Accept based on destination type
+	dest := req.FetchDest
+	switch dest {
+	case "style":
+		httpReq.Header.Set("Accept", "text/css,*/*;q=0.1")
+	case "image":
+		httpReq.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+	default: // "script", "empty", etc.
+		httpReq.Header.Set("Accept", "*/*")
+	}
+
+	httpReq.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	httpReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	// NoCors headers — subresource loads
+	httpReq.Header.Set("Sec-Fetch-Mode", "no-cors")
+	if dest != "" {
+		httpReq.Header.Set("Sec-Fetch-Dest", dest)
+	} else {
+		httpReq.Header.Set("Sec-Fetch-Dest", "empty")
+	}
+	// NO Origin header (no-cors doesn't send Origin)
+	// NO Sec-Fetch-User (only for navigation)
+	// NO Upgrade-Insecure-Requests (only for navigation)
+	// NO Priority header by default (Chrome doesn't send it for most script loads)
+}
+
 // detectSecFetchSiteForMode determines the Sec-Fetch-Site header value
 // CRITICAL: sec-fetch-site: none is ONLY valid for navigation mode
 // For CORS mode, JavaScript always runs in a page context, so it can NEVER be "none"
@@ -1695,8 +1748,8 @@ func detectSecFetchSiteForMode(fetchSite FetchSite, requestURL *url.URL, referer
 	// Auto-detect based on Referer
 	if referer == "" {
 		// No referer...
-		if mode == FetchModeCORS {
-			// CORS mode: JS is running on SOME page, we just don't know which
+		if mode == FetchModeCORS || mode == FetchModeNoCors {
+			// CORS/NoCors mode: JS/page is running on SOME page, we just don't know which
 			// Default to "cross-site" since most API calls are cross-origin
 			// (same-origin fetch would typically have a Referer)
 			return "cross-site"
@@ -1707,7 +1760,7 @@ func detectSecFetchSiteForMode(fetchSite FetchSite, requestURL *url.URL, referer
 
 	refererURL, err := url.Parse(referer)
 	if err != nil {
-		if mode == FetchModeCORS {
+		if mode == FetchModeCORS || mode == FetchModeNoCors {
 			return "cross-site"
 		}
 		return "none"

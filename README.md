@@ -30,7 +30,7 @@ One mismatch = blocked.
 ```python
 import httpcloak
 
-r = httpcloak.get("https://target.com", preset="chrome-144")
+r = httpcloak.get("https://target.com", preset="chrome-latest")
 ```
 
 That's it. Full browser transport layer fingerprint.
@@ -60,6 +60,7 @@ That's it. Full browser transport layer fingerprint.
 - Stream priorities (HPACK)
 - QUIC transport parameters
 - HTTP/3 GREASE frames
+- TCP/IP stack (TTL, MSS, Window)
 
 </td>
 <td width="33%" valign="top">
@@ -140,19 +141,19 @@ dotnet add package HttpCloak # C#
 import httpcloak
 
 # Simple request
-r = httpcloak.get("https://example.com", preset="chrome-144")
+r = httpcloak.get("https://example.com", preset="chrome-latest")
 print(r.status_code, r.protocol)
 
 # POST with JSON
 r = httpcloak.post("https://httpbin.org/post",
     json={"key": "value"},
-    preset="chrome-144"
+    preset="chrome-latest"
 )
 
 # Custom headers
 r = httpcloak.get("https://httpbin.org/headers",
     headers={"X-Custom": "value"},
-    preset="chrome-144"
+    preset="chrome-latest"
 )
 ```
 
@@ -165,7 +166,7 @@ import (
 )
 
 // Simple request
-c := client.NewClient("chrome-144")
+c := client.NewClient("chrome-latest")
 defer c.Close()
 
 resp, _ := c.Get(ctx, "https://example.com", nil)
@@ -191,7 +192,7 @@ resp, _ = c.Get(ctx, "https://httpbin.org/headers", map[string][]string{
 import httpcloak from "httpcloak";
 
 // Simple request
-const session = new httpcloak.Session({ preset: "chrome-144" });
+const session = new httpcloak.Session({ preset: "chrome-latest" });
 const r = await session.get("https://example.com");
 console.log(r.statusCode, r.protocol);
 
@@ -214,7 +215,7 @@ session.close();
 using HttpCloak;
 
 // Simple request
-using var session = new Session(preset: Presets.Chrome144);
+using var session = new Session(preset: Presets.Chrome145);
 var r = session.Get("https://example.com");
 Console.WriteLine($"{r.StatusCode} {r.Protocol}");
 
@@ -239,7 +240,7 @@ Hides which domain you're connecting to from network observers.
 
 ```python
 session = httpcloak.Session(
-    preset="chrome-144",
+    preset="chrome-latest",
     ech_from="cloudflare.com"  # Fetches ECH config from DNS
 )
 ```
@@ -281,10 +282,10 @@ session = httpcloak.Session(proxy="masque://proxy:443")
 
 Known MASQUE providers (auto-detected): Bright Data, Oxylabs, Smartproxy, SOAX.
 
-**Speculative TLS** (enabled by default): CONNECT + TLS ClientHello are sent together, saving one proxy round-trip (~25% faster). Disable if you experience issues with certain proxies:
+**Speculative TLS** (opt-in): CONNECT + TLS ClientHello are sent together, saving one proxy round-trip (~25% faster). Enable for compatible proxies:
 
 ```python
-session = httpcloak.Session(proxy="socks5://...", disable_speculative_tls=True)
+session = httpcloak.Session(proxy="socks5://...", enable_speculative_tls=True)
 ```
 
 ### 🎭 Domain Fronting
@@ -292,7 +293,7 @@ session = httpcloak.Session(proxy="socks5://...", disable_speculative_tls=True)
 Connect to a different host than what appears in TLS SNI.
 
 ```go
-client := httpcloak.NewClient("chrome-144",
+client := httpcloak.NewClient("chrome-latest",
     httpcloak.WithConnectTo("public-cdn.com", "actual-backend.internal"),
 )
 ```
@@ -330,19 +331,66 @@ fmt.Printf("DNS: %dms, TCP: %dms, TLS: %dms, Total: %dms\n",
 ### 🔄 Protocol Selection
 
 ```python
-session = httpcloak.Session(preset="chrome-144", http_version="h3")  # Force HTTP/3
-session = httpcloak.Session(preset="chrome-144", http_version="h2")  # Force HTTP/2
-session = httpcloak.Session(preset="chrome-144", http_version="h1")  # Force HTTP/1.1
+session = httpcloak.Session(preset="chrome-latest", http_version="h3")  # Force HTTP/3
+session = httpcloak.Session(preset="chrome-latest", http_version="h2")  # Force HTTP/2
+session = httpcloak.Session(preset="chrome-latest", http_version="h1")  # Force HTTP/1.1
 ```
 
 Auto mode tries HTTP/3 first, falls back gracefully.
+
+### 🖥️ TCP/IP Fingerprinting
+
+Anti-bot systems inspect TCP SYN packet parameters (TTL, Window Size, MSS, Window Scale) to verify your claimed OS matches. A request claiming Chrome on Windows but with Linux TCP parameters (TTL=64) is instantly flagged.
+
+httpcloak automatically sets the correct TCP/IP fingerprint for each preset's platform. You can also override manually:
+
+```python
+session = httpcloak.Session(
+    preset="chrome-latest-windows",
+    tcp_ttl=128,           # Windows=128, Linux/macOS=64
+    tcp_window_size=64240, # Windows=64240, Linux/macOS=65535
+    tcp_window_scale=8,    # Windows=8, Linux=7, macOS=6
+    tcp_mss=1460,          # Standard Ethernet MTU
+)
+```
+
+**Go:**
+```go
+client := client.NewClient("chrome-latest-windows",
+    client.WithTCPFingerprint(fingerprint.TCPFingerprint{
+        TTL: 128, MSS: 1460, WindowSize: 64240, WindowScale: 8, DFBit: true,
+    }),
+)
+```
+
+**Node.js:**
+```javascript
+const session = new httpcloak.Session({
+    preset: "chrome-latest-windows",
+    tcpTtl: 128,
+    tcpWindowSize: 64240,
+    tcpWindowScale: 8,
+});
+```
+
+**C#:**
+```csharp
+var session = new Session(
+    preset: Presets.Chrome145Windows,
+    tcpTtl: 128,
+    tcpWindowSize: 64240,
+    tcpWindowScale: 8
+);
+```
+
+Built-in platform profiles: Windows (TTL=128, WS=8), Linux (TTL=64, WS=7), macOS (TTL=64, WS=6).
 
 ### 🔀 Runtime Proxy Switching
 
 Switch proxies mid-session without creating new connections. Perfect for proxy rotation.
 
 ```python
-session = httpcloak.Session(preset="chrome-144")
+session = httpcloak.Session(preset="chrome-latest")
 
 # Start with direct connection
 r = session.get("https://api.ipify.org")
@@ -365,7 +413,7 @@ session.set_proxy("")
 **Split proxy configuration** - use different proxies for HTTP/2 and HTTP/3:
 
 ```python
-session = httpcloak.Session(preset="chrome-144")
+session = httpcloak.Session(preset="chrome-latest")
 
 # TCP proxy for HTTP/1.1 and HTTP/2
 session.set_tcp_proxy("http://tcp-proxy.example.com:8080")
@@ -383,7 +431,7 @@ print(session.get_udp_proxy())  # UDP proxy URL
 Control the order headers are sent for advanced fingerprinting scenarios.
 
 ```python
-session = httpcloak.Session(preset="chrome-144")
+session = httpcloak.Session(preset="chrome-latest")
 
 # Get the current header order (from preset)
 print(session.get_header_order())
@@ -454,12 +502,12 @@ r = session.post(url, files={
 # Basic auth
 r = httpcloak.get("https://api.example.com/data",
     auth=("username", "password"),
-    preset="chrome-144"
+    preset="chrome-latest"
 )
 
 # Session-level auth
 session = httpcloak.Session(
-    preset="chrome-144",
+    preset="chrome-latest",
     auth=("username", "password")
 )
 ```
@@ -468,7 +516,7 @@ session = httpcloak.Session(
 
 ```python
 # Timeout
-session = httpcloak.Session(preset="chrome-144", timeout=30)
+session = httpcloak.Session(preset="chrome-latest", timeout=30)
 
 # Per-request timeout
 r = session.get("https://slow-api.com/data", timeout=60)
@@ -476,7 +524,7 @@ r = session.get("https://slow-api.com/data", timeout=60)
 
 ```go
 // Go: Timeout and retry configuration
-client := client.NewClient("chrome-144",
+client := client.NewClient("chrome-latest",
     client.WithTimeout(30 * time.Second),
     client.WithRetry(3),  // Retry 3 times on 429, 500, 502, 503, 504
     client.WithRetryConfig(
@@ -492,7 +540,7 @@ client := client.NewClient("chrome-144",
 
 ```go
 // Disable automatic redirects
-client := client.NewClient("chrome-144",
+client := client.NewClient("chrome-latest",
     client.WithoutRedirects(),
 )
 
@@ -506,7 +554,7 @@ fmt.Println(resp.GetHeader("location"))   // Redirect URL
 Simulates a browser page refresh - closes all TCP/QUIC connections but keeps TLS session cache intact. On next request, connections use TLS resumption (like a real browser).
 
 ```python
-session = httpcloak.Session(preset="chrome-144")
+session = httpcloak.Session(preset="chrome-latest")
 
 # Make some requests
 session.get("https://example.com/page1")
@@ -521,7 +569,7 @@ session.get("https://example.com/page1")
 
 **Go:**
 ```go
-session := httpcloak.NewSession("chrome-144")
+session := httpcloak.NewSession("chrome-latest")
 session.Get(ctx, "https://example.com")
 session.Refresh()  // Close connections, keep TLS cache
 session.Get(ctx, "https://example.com")  // TLS resumption
@@ -542,7 +590,7 @@ session.Refresh();
 Simulates a real browser page load - fetches the HTML page and all its subresources (CSS, JS, images, fonts) with realistic headers, priorities, and timing. After warmup, the session has TLS session tickets, cookies, and cache headers populated.
 
 ```python
-session = httpcloak.Session(preset="chrome-144")
+session = httpcloak.Session(preset="chrome-latest")
 
 # Fetches page + subresources with realistic browser behavior
 session.warmup("https://example.com")
@@ -553,7 +601,7 @@ r = session.get("https://example.com/api/data")
 
 **Go:**
 ```go
-session := httpcloak.NewSession("chrome-144")
+session := httpcloak.NewSession("chrome-latest")
 session.Warmup(ctx, "https://example.com")
 session.Get(ctx, "https://example.com/api/data")  // Looks like real user
 ```
@@ -573,7 +621,7 @@ session.Warmup("https://example.com");
 Creates N sessions that share cookies and TLS session caches with the parent but have independent connections. This simulates multiple browser tabs - same cookies, same TLS resumption tickets, same fingerprint, but independent TCP/QUIC connections for parallel requests.
 
 ```python
-session = httpcloak.Session(preset="chrome-144")
+session = httpcloak.Session(preset="chrome-latest")
 session.warmup("https://example.com")
 
 # Create 10 parallel "tabs" sharing cookies + TLS cache
@@ -587,7 +635,7 @@ for i, tab in enumerate(tabs):
 
 **Go:**
 ```go
-session := httpcloak.NewSession("chrome-144")
+session := httpcloak.NewSession("chrome-latest")
 session.Warmup(ctx, "https://example.com")
 
 tabs := session.Fork(10)
@@ -621,7 +669,7 @@ Bind outgoing connections to a specific local IP address. Essential for IPv6 rot
 ```python
 # Bind to specific IPv6 address
 session = httpcloak.Session(
-    preset="chrome-144",
+    preset="chrome-latest",
     local_address="2001:db8::1"
 )
 
@@ -631,14 +679,14 @@ print(r.text)  # Shows 2001:db8::1
 
 # IPv4 works too
 session = httpcloak.Session(
-    preset="chrome-144",
+    preset="chrome-latest",
     local_address="192.168.1.100"
 )
 ```
 
 **Go:**
 ```go
-session := httpcloak.NewSession("chrome-144",
+session := httpcloak.NewSession("chrome-latest",
     httpcloak.WithLocalAddress("2001:db8::1"),
 )
 ```
@@ -646,7 +694,7 @@ session := httpcloak.NewSession("chrome-144",
 **Node.js:**
 ```javascript
 const session = new httpcloak.Session({
-    preset: "chrome-144",
+    preset: "chrome-latest",
     localAddress: "2001:db8::1"
 });
 ```
@@ -654,7 +702,7 @@ const session = new httpcloak.Session({
 **C#:**
 ```csharp
 var session = new Session(
-    preset: Presets.Chrome144,
+    preset: Presets.Chrome145,
     localAddress: "2001:db8::1"
 );
 ```
@@ -667,7 +715,7 @@ Write TLS session keys to a file for traffic decryption in Wireshark. Works with
 
 ```python
 session = httpcloak.Session(
-    preset="chrome-144",
+    preset="chrome-latest",
     key_log_file="/tmp/keys.log"
 )
 
@@ -679,7 +727,7 @@ session.get("https://example.com")
 
 **Go:**
 ```go
-session := httpcloak.NewSession("chrome-144",
+session := httpcloak.NewSession("chrome-latest",
     httpcloak.WithKeyLogFile("/tmp/keys.log"),
 )
 ```
@@ -687,7 +735,7 @@ session := httpcloak.NewSession("chrome-144",
 **Node.js:**
 ```javascript
 const session = new httpcloak.Session({
-    preset: "chrome-144",
+    preset: "chrome-latest",
     keyLogFile: "/tmp/keys.log"
 });
 ```
@@ -695,7 +743,7 @@ const session = new httpcloak.Session({
 **C#:**
 ```csharp
 var session = new Session(
-    preset: Presets.Chrome144,
+    preset: Presets.Chrome145,
     keyLogFile: "/tmp/keys.log"
 );
 ```
@@ -722,7 +770,7 @@ httpcloak.options(url, **kwargs)
 
 # Session class
 session = httpcloak.Session(
-    preset="chrome-144",       # Browser preset (default)
+    preset="chrome-latest",       # Browser preset (default)
     proxy="socks5://...",      # Proxy URL
     timeout=30,                # Timeout in seconds
     http_version="h3",         # Force protocol: h1, h2, h3, auto
@@ -772,7 +820,7 @@ response.raise_for_status()    # Raise on 4xx/5xx
 import "github.com/sardanioss/httpcloak/client"
 
 // Client creation
-c := client.NewClient("chrome-144",
+c := client.NewClient("chrome-latest",
     client.WithTimeout(30 * time.Second),
     client.WithProxy("socks5://..."),
     client.WithRetry(3),
@@ -833,7 +881,7 @@ import httpcloak from "httpcloak";
 
 // Session creation
 const session = new httpcloak.Session({
-    preset: "chrome-144",
+    preset: "chrome-latest",
     proxy: "socks5://...",
     timeout: 30000,
     httpVersion: "h3",
@@ -881,7 +929,7 @@ using HttpCloak;
 
 // Session creation
 var session = new Session(
-    preset: Presets.Chrome144,
+    preset: Presets.Chrome145,
     proxy: "socks5://...",
     timeout: 30
 );
@@ -924,6 +972,18 @@ response.Protocol
 
 | Preset | Platform | PQ | H3 |
 |--------|----------|:--:|:--:|
+| `chrome-146` | Auto | ✅ | ✅ |
+| `chrome-146-windows` | Windows | ✅ | ✅ |
+| `chrome-146-macos` | macOS | ✅ | ✅ |
+| `chrome-146-linux` | Linux | ✅ | ✅ |
+| `chrome-146-ios` | iOS | ✅ | ✅ |
+| `chrome-146-android` | Android | ✅ | ✅ |
+| `chrome-145` | Auto | ✅ | ✅ |
+| `chrome-145-windows` | Windows | ✅ | ✅ |
+| `chrome-145-macos` | macOS | ✅ | ✅ |
+| `chrome-145-linux` | Linux | ✅ | ✅ |
+| `chrome-145-ios` | iOS | ✅ | ✅ |
+| `chrome-145-android` | Android | ✅ | ✅ |
 | `chrome-144` | Auto | ✅ | ✅ |
 | `chrome-144-windows` | Windows | ✅ | ✅ |
 | `chrome-144-macos` | macOS | ✅ | ✅ |
@@ -932,13 +992,20 @@ response.Protocol
 | `chrome-143-windows` | Windows | ✅ | ✅ |
 | `chrome-143-macos` | macOS | ✅ | ✅ |
 | `chrome-143-linux` | Linux | ✅ | ✅ |
+| `chrome-141` | Auto | ✅ | ❌ |
+| `chrome-133` | Auto | ✅ | ❌ |
 | `firefox-133` | Auto | ❌ | ❌ |
 | `safari-18` | macOS | ❌ | ✅ |
-| `ios-safari-18` | iOS | ❌ | ✅ |
-| `android-chrome-144` | Android | ✅ | ✅ |
-| `android-chrome-143` | Android | ✅ | ✅ |
-| `ios-chrome-144` | iOS | ✅ | ✅ |
-| `ios-chrome-143` | iOS | ✅ | ✅ |
+| `safari-18-ios` | iOS | ❌ | ✅ |
+| `safari-17-ios` | iOS | ❌ | ❌ |
+| `chrome-146-ios` | iOS | ✅ | ✅ |
+| `chrome-145-ios` | iOS | ✅ | ✅ |
+| `chrome-144-ios` | iOS | ✅ | ✅ |
+| `chrome-143-ios` | iOS | ✅ | ✅ |
+| `chrome-146-android` | Android | ✅ | ✅ |
+| `chrome-145-android` | Android | ✅ | ✅ |
+| `chrome-144-android` | Android | ✅ | ✅ |
+| `chrome-143-android` | Android | ✅ | ✅ |
 
 **PQ** = Post-Quantum (X25519MLKEM768) · **H3** = HTTP/3
 

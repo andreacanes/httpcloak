@@ -5,7 +5,7 @@
 //
 // Basic usage:
 //
-//	client := httpcloak.New("chrome-131")
+//	client := httpcloak.New("chrome-146")
 //	defer client.Close()
 //
 //	resp, err := client.Get(ctx, "https://example.com")
@@ -16,7 +16,7 @@
 //
 // With options:
 //
-//	client := httpcloak.New("chrome-131",
+//	client := httpcloak.New("chrome-146",
 //	    httpcloak.WithTimeout(30*time.Second),
 //	    httpcloak.WithProxy("http://user:pass@proxy:8080"),
 //	)
@@ -27,7 +27,10 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"io"
+	"mime/multipart"
+	"net/textproto"
 	"strings"
 	"time"
 
@@ -36,6 +39,7 @@ import (
 	"github.com/sardanioss/httpcloak/protocol"
 	"github.com/sardanioss/httpcloak/session"
 	"github.com/sardanioss/httpcloak/transport"
+	tls "github.com/sardanioss/utls"
 )
 
 // systemRoots is pre-loaded at init time to avoid ~40ms delay on first TLS connection
@@ -80,11 +84,11 @@ func WithProxy(proxyURL string) Option {
 //
 // Available presets:
 //   - "chrome-latest" (recommended), "chrome-latest-windows", "chrome-latest-linux", "chrome-latest-macos"
-//   - "chrome-144", "chrome-143", "chrome-141", "chrome-133"
+//   - "chrome-146", "chrome-145", "chrome-144", "chrome-143", "chrome-141", "chrome-133"
 //   - "firefox-latest", "firefox-133"
 //   - "safari-latest", "safari-18"
-//   - "ios-chrome-latest", "ios-safari-latest"
-//   - "android-chrome-latest"
+//   - "chrome-latest-ios", "safari-latest-ios"
+//   - "chrome-latest-android"
 //
 // The -latest aliases always resolve to the newest version in the library.
 //
@@ -110,6 +114,50 @@ func New(preset string, opts ...Option) *Client {
 		inner:   client.NewClient(preset, clientOpts...),
 		timeout: cfg.timeout,
 	}
+}
+
+// MultipartField represents a single field in a multipart/form-data body.
+// For text fields, set Name and Value. For file uploads, set Name, Filename,
+// Content, and optionally ContentType (defaults to application/octet-stream).
+type MultipartField struct {
+	Name        string // Form field name
+	Value       string // Text value (used when Filename is empty)
+	Filename    string // If set, this field is a file upload
+	Content     []byte // File content (used when Filename is set)
+	ContentType string // MIME type for file uploads (default: application/octet-stream)
+}
+
+// BuildMultipart encodes fields into a multipart/form-data body.
+// Returns the encoded body bytes and the Content-Type header value (including boundary).
+func BuildMultipart(fields []MultipartField) ([]byte, string, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	for _, f := range fields {
+		if f.Filename != "" {
+			ct := f.ContentType
+			if ct == "" {
+				ct = "application/octet-stream"
+			}
+			part, err := w.CreatePart(textproto.MIMEHeader{
+				"Content-Disposition": {fmt.Sprintf(`form-data; name="%s"; filename="%s"`, f.Name, f.Filename)},
+				"Content-Type":        {ct},
+			})
+			if err != nil {
+				return nil, "", err
+			}
+			if _, err := part.Write(f.Content); err != nil {
+				return nil, "", err
+			}
+		} else {
+			if err := w.WriteField(f.Name, f.Value); err != nil {
+				return nil, "", err
+			}
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), w.FormDataContentType(), nil
 }
 
 // Request represents an HTTP request
@@ -278,6 +326,15 @@ func (c *Client) PostForm(ctx context.Context, url string, body []byte) (*Respon
 	return c.Post(ctx, url, bytes.NewReader(body), "application/x-www-form-urlencoded")
 }
 
+// PostMultipart performs a POST request with multipart/form-data body.
+func (c *Client) PostMultipart(ctx context.Context, url string, fields []MultipartField) (*Response, error) {
+	body, contentType, err := BuildMultipart(fields)
+	if err != nil {
+		return nil, err
+	}
+	return c.Post(ctx, url, bytes.NewReader(body), contentType)
+}
+
 // Close releases all resources held by the client
 func (c *Client) Close() {
 	c.inner.Close()
@@ -285,7 +342,8 @@ func (c *Client) Close() {
 
 // Session represents a persistent HTTP session with cookie management
 type Session struct {
-	inner *session.Session
+	inner     *session.Session
+	configErr error // deferred config error (e.g. invalid Akamai string)
 }
 
 // SessionOption configures a session
@@ -315,7 +373,7 @@ type sessionConfig struct {
 	localAddr          string            // Local IP address to bind outgoing connections
 	keyLogFile         string            // Path to write TLS key log for Wireshark decryption
 	disableECH            bool   // Disable ECH lookup for faster first request
-	disableSpeculativeTLS bool   // Disable speculative TLS optimization for proxy connections
+	enableSpeculativeTLS bool   // Enable speculative TLS optimization for proxy connections
 	switchProtocol        string // Protocol to switch to after Refresh() (e.g. "h1", "h2", "h3")
 
 	// Disable internal cookie jar (caller manages cookies via headers)
@@ -324,6 +382,15 @@ type sessionConfig struct {
 	// Distributed session cache
 	sessionCacheBackend       transport.SessionCacheBackend
 	sessionCacheErrorCallback transport.ErrorCallback
+
+	// Custom fingerprint
+	customJA3            string
+	customJA3Extras      *fingerprint.JA3Extras
+	customH2Settings     *fingerprint.HTTP2Settings
+	customPseudoOrder    []string
+	customTCPFingerprint *fingerprint.TCPFingerprint
+
+	configErr error // deferred error from option parsing
 }
 
 // WithSessionProxy sets a proxy for the session
@@ -458,12 +525,12 @@ func WithDisableECH() SessionOption {
 	}
 }
 
-// WithDisableSpeculativeTLS disables the speculative TLS optimization for proxy connections.
-// By default, httpcloak sends the CONNECT request and TLS ClientHello together to save
-// one round-trip (~25% faster). Disable this if you experience issues with certain proxies.
-func WithDisableSpeculativeTLS() SessionOption {
+// WithEnableSpeculativeTLS enables the speculative TLS optimization for proxy connections.
+// When enabled, the CONNECT request and TLS ClientHello are sent together, saving one
+// round-trip (~25% faster). Disabled by default due to compatibility issues with some proxies.
+func WithEnableSpeculativeTLS() SessionOption {
 	return func(c *sessionConfig) {
-		c.disableSpeculativeTLS = true
+		c.enableSpeculativeTLS = true
 	}
 }
 
@@ -540,6 +607,83 @@ func WithoutCookieJar() SessionOption {
 	}
 }
 
+// CustomFingerprint configures custom TLS (JA3) and HTTP/2 (Akamai) fingerprints.
+// This overrides the preset's fingerprint for fine-grained control.
+type CustomFingerprint struct {
+	// JA3 is a JA3 fingerprint string.
+	// Format: TLSVersion,CipherSuites,Extensions,EllipticCurves,PointFormats
+	// Example: "771,4865-4866-4867-49195-49199,0-23-65281-10-11-35-16-5-13-18-51-45-43-27-17513-21,29-23-24,0"
+	JA3 string
+
+	// Akamai is an Akamai HTTP/2 fingerprint string.
+	// Format: SETTINGS|WINDOW_UPDATE|PRIORITY|PSEUDO_HEADER_ORDER
+	// Example: "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p"
+	Akamai string
+
+	// SignatureAlgorithms overrides the default signature algorithms for the JA3 spec.
+	// Valid values: "ecdsa_secp256r1_sha256", "rsa_pss_rsae_sha256", "rsa_pkcs1_sha256",
+	// "ecdsa_secp384r1_sha384", "rsa_pss_rsae_sha384", "rsa_pkcs1_sha384",
+	// "rsa_pss_rsae_sha512", "rsa_pkcs1_sha512"
+	SignatureAlgorithms []string
+
+	// ALPN overrides the default ALPN protocols. Default: ["h2", "http/1.1"]
+	ALPN []string
+
+	// CertCompression overrides the cert compression algorithms.
+	// Valid values: "brotli", "zlib", "zstd"
+	CertCompression []string
+
+	// PermuteExtensions randomly permutes the TLS extension order.
+	PermuteExtensions bool
+}
+
+// WithCustomFingerprint sets a custom TLS/HTTP2 fingerprint for the session.
+// When JA3 is set, TLS-only mode is automatically enabled (preset HTTP headers are skipped).
+// WithTCPFingerprint overrides individual TCP/IP fingerprint fields from the preset.
+// Only non-zero fields are applied; zero fields keep the preset default.
+func WithTCPFingerprint(fp fingerprint.TCPFingerprint) SessionOption {
+	return func(c *sessionConfig) {
+		c.customTCPFingerprint = &fp
+	}
+}
+
+func WithCustomFingerprint(fp CustomFingerprint) SessionOption {
+	return func(c *sessionConfig) {
+		c.customJA3 = fp.JA3
+
+		// Build JA3Extras from user-friendly string-based fields
+		if fp.JA3 != "" {
+			extras := &fingerprint.JA3Extras{
+				PermuteExtensions: fp.PermuteExtensions,
+				RecordSizeLimit:   0x4001,
+			}
+			if len(fp.ALPN) > 0 {
+				extras.ALPN = fp.ALPN
+			}
+			if len(fp.SignatureAlgorithms) > 0 {
+				extras.SignatureAlgorithms = parseSignatureAlgorithms(fp.SignatureAlgorithms)
+			}
+			if len(fp.CertCompression) > 0 {
+				extras.CertCompAlgs = parseCertCompression(fp.CertCompression)
+			}
+			c.customJA3Extras = extras
+			// Auto-enable TLS-only mode when custom JA3 is set
+			c.tlsOnly = true
+		}
+
+		// Parse Akamai fingerprint
+		if fp.Akamai != "" {
+			h2Settings, pseudoOrder, err := fingerprint.ParseAkamai(fp.Akamai)
+			if err != nil {
+				c.configErr = fmt.Errorf("invalid Akamai fingerprint: %w", err)
+			} else {
+				c.customH2Settings = h2Settings
+				c.customPseudoOrder = pseudoOrder
+			}
+		}
+	}
+}
+
 // NewSession creates a new persistent session with cookie management
 func NewSession(preset string, opts ...SessionOption) *Session {
 	cfg := &sessionConfig{
@@ -567,7 +711,7 @@ func NewSession(preset string, opts ...SessionOption) *Session {
 		LocalAddress:       cfg.localAddr,
 		KeyLogFile:         cfg.keyLogFile,
 		DisableECH:            cfg.disableECH,
-		DisableSpeculativeTLS: cfg.disableSpeculativeTLS,
+		EnableSpeculativeTLS: cfg.enableSpeculativeTLS,
 		SwitchProtocol:        cfg.switchProtocol,
 		WithoutCookieJar:      cfg.withoutCookieJar,
 	}
@@ -600,22 +744,31 @@ func NewSession(preset string, opts ...SessionOption) *Session {
 		sessionCfg.ForceHTTP3 = true
 	}
 
-	// Create session with optional distributed cache
+	// Create session with optional distributed cache and custom fingerprint
 	var s *session.Session
-	if cfg.sessionCacheBackend != nil {
+	needsOpts := cfg.sessionCacheBackend != nil || cfg.customJA3 != "" || cfg.customH2Settings != nil || len(cfg.customPseudoOrder) > 0 || cfg.customTCPFingerprint != nil
+	if needsOpts {
 		opts := &session.SessionOptions{
 			SessionCacheBackend:       cfg.sessionCacheBackend,
 			SessionCacheErrorCallback: cfg.sessionCacheErrorCallback,
+			CustomJA3:                 cfg.customJA3,
+			CustomJA3Extras:           cfg.customJA3Extras,
+			CustomH2Settings:          cfg.customH2Settings,
+			CustomPseudoOrder:         cfg.customPseudoOrder,
+			CustomTCPFingerprint:      cfg.customTCPFingerprint,
 		}
 		s = session.NewSessionWithOptions("", sessionCfg, opts)
 	} else {
 		s = session.NewSession("", sessionCfg)
 	}
-	return &Session{inner: s}
+	return &Session{inner: s, configErr: cfg.configErr}
 }
 
 // Do executes a request within the session, maintaining cookies
 func (s *Session) Do(ctx context.Context, req *Request) (*Response, error) {
+	if s.configErr != nil {
+		return nil, s.configErr
+	}
 	sReq := &transport.Request{
 		Method:     req.Method,
 		URL:        req.URL,
@@ -654,6 +807,9 @@ func (s *Session) Do(ctx context.Context, req *Request) (*Response, error) {
 
 // DoWithBody executes a request with an io.Reader as the body for streaming uploads
 func (s *Session) DoWithBody(ctx context.Context, req *Request, bodyReader io.Reader) (*Response, error) {
+	if s.configErr != nil {
+		return nil, s.configErr
+	}
 	sReq := &transport.Request{
 		Method:     req.Method,
 		URL:        req.URL,
@@ -695,14 +851,38 @@ func (s *Session) Get(ctx context.Context, url string) (*Response, error) {
 	return s.Do(ctx, &Request{Method: "GET", URL: url})
 }
 
-// GetCookies returns all cookies stored in the session
-func (s *Session) GetCookies() map[string]string {
+// CookieInfo represents a cookie with full metadata (domain, path, expiry, etc.)
+type CookieInfo = session.CookieState
+
+// GetCookies returns all cookies stored in the session with full metadata.
+//
+// Note: In bindings (Node.js, Python, .NET), GetCookies currently returns a
+// flat name-value map for backward compatibility, with a deprecation warning.
+// In a future release, all bindings will change to return the same []CookieInfo
+// format as this Go method. GetCookiesDetailed already returns this format in
+// all bindings.
+func (s *Session) GetCookies() []CookieInfo {
 	return s.inner.GetCookies()
 }
 
-// SetCookie sets a cookie in the session
-func (s *Session) SetCookie(name, value string) {
-	s.inner.SetCookie(name, value)
+// GetCookiesDetailed returns all cookies with full metadata (domain, path, expiry, etc.)
+func (s *Session) GetCookiesDetailed() []CookieInfo {
+	return s.inner.GetCookies()
+}
+
+// SetCookie sets a cookie in the session with full metadata
+func (s *Session) SetCookie(cookie CookieInfo) {
+	s.inner.SetCookie(cookie.Name, cookie.Value, cookie.Domain, cookie.Path, cookie.Secure, cookie.HttpOnly, cookie.SameSite, cookie.MaxAge, cookie.Expires)
+}
+
+// DeleteCookie removes cookies by name. If domain is empty, removes from all domains.
+func (s *Session) DeleteCookie(name, domain string) {
+	s.inner.DeleteCookie(name, domain)
+}
+
+// ClearCookies removes all cookies from the session
+func (s *Session) ClearCookies() {
+	s.inner.ClearCookies()
 }
 
 // SetProxy sets or updates the proxy for all protocols (HTTP/1.1, HTTP/2, HTTP/3)
@@ -864,6 +1044,9 @@ func (r *StreamResponse) ReadChunk(size int) ([]byte, error) {
 // The caller is responsible for closing the response when done
 // Note: Streaming does NOT support redirects - use Do() for redirect handling
 func (s *Session) DoStream(ctx context.Context, req *Request) (*StreamResponse, error) {
+	if s.configErr != nil {
+		return nil, s.configErr
+	}
 	sReq := &transport.Request{
 		Method:     req.Method,
 		URL:        req.URL,
@@ -900,4 +1083,48 @@ func (s *Session) GetStreamWithHeaders(ctx context.Context, url string, headers 
 // Presets returns available fingerprint presets
 func Presets() []string {
 	return fingerprint.Available()
+}
+
+// parseSignatureAlgorithms converts string names to tls.SignatureScheme values.
+func parseSignatureAlgorithms(names []string) []tls.SignatureScheme {
+	m := map[string]tls.SignatureScheme{
+		"ecdsa_secp256r1_sha256": tls.ECDSAWithP256AndSHA256,
+		"ecdsa_secp384r1_sha384": tls.ECDSAWithP384AndSHA384,
+		"ecdsa_secp521r1_sha512": tls.ECDSAWithP521AndSHA512,
+		"rsa_pss_rsae_sha256":    tls.PSSWithSHA256,
+		"rsa_pss_rsae_sha384":    tls.PSSWithSHA384,
+		"rsa_pss_rsae_sha512":    tls.PSSWithSHA512,
+		"rsa_pkcs1_sha256":       tls.PKCS1WithSHA256,
+		"rsa_pkcs1_sha384":       tls.PKCS1WithSHA384,
+		"rsa_pkcs1_sha512":       tls.PKCS1WithSHA512,
+	}
+	var result []tls.SignatureScheme
+	for _, name := range names {
+		if scheme, ok := m[strings.ToLower(name)]; ok {
+			result = append(result, scheme)
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// parseCertCompression converts string names to tls.CertCompressionAlgo values.
+func parseCertCompression(names []string) []tls.CertCompressionAlgo {
+	m := map[string]tls.CertCompressionAlgo{
+		"brotli": tls.CertCompressionBrotli,
+		"zlib":   tls.CertCompressionZlib,
+		"zstd":   tls.CertCompressionZstd,
+	}
+	var result []tls.CertCompressionAlgo
+	for _, name := range names {
+		if algo, ok := m[strings.ToLower(name)]; ok {
+			result = append(result, algo)
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }

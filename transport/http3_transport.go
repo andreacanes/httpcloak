@@ -20,6 +20,7 @@ import (
 	"github.com/sardanioss/httpcloak/proxy"
 	"github.com/sardanioss/quic-go"
 	"github.com/sardanioss/quic-go/http3"
+	"github.com/sardanioss/quic-go/quicvarint"
 	"github.com/sardanioss/udpbara"
 	tls "github.com/sardanioss/utls"
 	utls "github.com/sardanioss/utls"
@@ -37,15 +38,24 @@ const (
 const (
 	tpVersionInformation = 0x11   // RFC 9368 version negotiation
 	tpGoogleVersion      = 0x4752 // Google's custom version param (18258)
+	tpInitialRTT              = 0x3127 // initial_rtt (12583) - Chrome's cached SRTT
+	tpGoogleConnectionOptions = 0x3128 // Google's connection options param (12584)
+)
+
+// RTT measurement state — measure once per process, re-measure after ResetInitialRTT().
+var (
+	rttMu       sync.Mutex
+	rttMeasured bool
 )
 
 func init() {
 	// Set Chrome-like additional transport parameters
-	quic.SetAdditionalTransportParameters(buildChromeTransportParams())
+	quic.SetAdditionalTransportParameters(BuildChromeTransportParams())
 }
 
-// buildChromeTransportParams creates Chrome-like QUIC transport parameters
-func buildChromeTransportParams() map[uint64][]byte {
+// BuildChromeTransportParams creates Chrome-like QUIC transport parameters.
+// Exported so pool and other packages can reference the canonical set.
+func BuildChromeTransportParams() map[uint64][]byte {
 	params := make(map[uint64][]byte)
 
 	// version_information (0x11) - RFC 9368
@@ -67,7 +77,62 @@ func buildChromeTransportParams() map[uint64][]byte {
 	binary.BigEndian.PutUint32(googleVersion, 0x00000001) // QUICv1
 	params[tpGoogleVersion] = googleVersion
 
+	// google_connection_options (0x3128 / 12584) - Chrome sends "B2ON"
+	params[tpGoogleConnectionOptions] = []byte("B2ON")
+
+	// initial_rtt (0x3127) - Chrome sends cached SRTT in microseconds
+	// Default 100ms (100000μs); MeasureAndSetInitialRTT overrides with real RTT
+	initialRTT := make([]byte, 0, 8)
+	initialRTT = quicvarint.Append(initialRTT, 100000) // 100ms fallback
+	params[tpInitialRTT] = initialRTT
+
+	// Note: GREASE transport param is NOT added here — quic-go's Chrome-mode
+	// marshaling (transport_parameters.go) already inserts exactly 1 GREASE param
+	// at the correct position (after max_datagram_frame_size).
+
 	return params
+}
+
+// MeasureAndSetInitialRTT measures TCP RTT to host:port and updates the
+// initial_rtt QUIC transport parameter. Called once before first QUIC dial.
+// If measurement fails, keeps the default 100ms.
+func MeasureAndSetInitialRTT(ctx context.Context, host string, port int) {
+	rttMu.Lock()
+	defer rttMu.Unlock()
+	if rttMeasured {
+		return
+	}
+	rttMeasured = true
+
+	// Quick TCP SYN-ACK RTT probe (connect + immediate close)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(probeCtx, "tcp", addr)
+	rtt := time.Since(start)
+	if conn != nil {
+		conn.Close()
+	}
+	if err != nil {
+		return // keep default 100ms
+	}
+
+	// Rebuild transport params with measured RTT
+	params := BuildChromeTransportParams()
+	rttValue := make([]byte, 0, 8)
+	rttValue = quicvarint.Append(rttValue, uint64(rtt.Microseconds()))
+	params[tpInitialRTT] = rttValue
+	quic.SetAdditionalTransportParameters(params)
+}
+
+// ResetInitialRTT allows re-measurement for new sessions/hosts.
+func ResetInitialRTT() {
+	rttMu.Lock()
+	defer rttMu.Unlock()
+	rttMeasured = false
 }
 
 // generateGREASEVersion generates a GREASE version of form 0x?a?a?a?a
@@ -1085,6 +1150,10 @@ func (t *HTTP3Transport) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.
 		return nil, fmt.Errorf("invalid port: %w", err)
 	}
 
+	// Measure RTT to target before QUIC dial so initial_rtt matches real latency.
+	// Uses first resolved IP; runs once per process (cached via rttMeasured flag).
+	MeasureAndSetInitialRTT(ctx, ips[0].String(), portInt)
+
 	// Filter IPs by local address family if set
 	if t.localAddr != "" {
 		localIP := net.ParseIP(t.localAddr)
@@ -1314,6 +1383,9 @@ func (t *HTTP3Transport) Close() error {
 	if t.masqueConn != nil {
 		t.masqueConn.Close()
 	}
+
+	// Allow next session to re-measure RTT (may connect to different host)
+	ResetInitialRTT()
 
 	return nil
 }

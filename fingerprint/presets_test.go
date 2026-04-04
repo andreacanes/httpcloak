@@ -47,8 +47,10 @@ func TestAvailableWithInfo(t *testing.T) {
 	h3Presets := []string{
 		"chrome-143", "chrome-143-windows", "chrome-143-linux", "chrome-143-macos",
 		"chrome-144", "chrome-144-windows", "chrome-144-linux", "chrome-144-macos",
-		"safari-18", "ios-chrome-143", "ios-chrome-144",
-		"ios-safari-18", "android-chrome-143", "android-chrome-144",
+		"chrome-145", "chrome-145-windows", "chrome-145-linux", "chrome-145-macos",
+		"chrome-146", "chrome-146-windows", "chrome-146-linux", "chrome-146-macos",
+		"safari-18", "chrome-143-ios", "chrome-144-ios", "chrome-145-ios", "chrome-146-ios",
+		"safari-18-ios", "chrome-143-android", "chrome-144-android", "chrome-145-android", "chrome-146-android",
 	}
 	for _, name := range h3Presets {
 		pi, ok := info[name]
@@ -68,7 +70,7 @@ func TestAvailableWithInfo(t *testing.T) {
 	}
 
 	// Known non-H3 presets must NOT have h3
-	noH3Presets := []string{"chrome-133", "chrome-141", "firefox-133", "ios-safari-17"}
+	noH3Presets := []string{"chrome-133", "chrome-141", "firefox-133", "safari-17-ios"}
 	for _, name := range noH3Presets {
 		pi, ok := info[name]
 		if !ok {

@@ -410,6 +410,7 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 			Timeout:   t.connectTimeout,
 			KeepAlive: 30 * time.Second,
 		}
+		SetDialerControl(dialer, &t.preset.TCPFingerprint)
 		if t.localAddr != "" {
 			localIP := net.ParseIP(t.localAddr)
 			dialer.LocalAddr = &net.TCPAddr{IP: localIP}
@@ -487,30 +488,61 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 			InsecureSkipVerify:                 t.insecureSkipVerify,
 			MinVersion:                         tls.VersionTLS12,
 			MaxVersion:                         tls.VersionTLS13,
-			ClientSessionCache:                 t.sessionCache,
 			NextProtos:                         []string{"http/1.1"}, // Force HTTP/1.1 only
 			PreferSkipResumptionOnNilExtension: true,                 // Skip resumption if spec has no PSK extension
 			KeyLogWriter:                       keyLogWriter,
 		}
-
-		// For HTTP/1.1 transport, use ClientHelloID directly
-		// Note: ClientHelloID includes ALPN with [h2, http/1.1], so we must modify it
-		tlsConn := utls.UClient(rawConn, tlsConfig, t.preset.ClientHelloID)
-		tlsConn.SetSessionCache(t.sessionCache)
-
-		// Build handshake state first - this populates Extensions from ClientHelloID
-		if err := tlsConn.BuildHandshakeState(); err != nil {
-			rawConn.Close()
-			return nil, NewTLSError("build_handshake", host, port, "h1", err)
+		// Only set session cache when not using custom JA3 without PSK extension
+		if t.config == nil || t.config.CustomJA3 == "" || ja3HasExtension(t.config.CustomJA3, "41") {
+			tlsConfig.ClientSessionCache = t.sessionCache
 		}
 
-		// Force HTTP/1.1 only ALPN to prevent h2 negotiation
-		// Must be done AFTER BuildHandshakeState() which generates the extensions
-		for _, ext := range tlsConn.Extensions {
-			if alpn, ok := ext.(*utls.ALPNExtension); ok {
-				alpn.AlpnProtocols = []string{"http/1.1"}
-				break
+		// Create TLS connection with appropriate fingerprint
+		var tlsConn *utls.UConn
+		if t.config != nil && t.config.CustomJA3 != "" {
+			// Custom JA3: parse to spec and apply with HelloCustom
+			spec, parseErr := fingerprint.ParseJA3(t.config.CustomJA3, t.config.CustomJA3Extras)
+			if parseErr != nil {
+				rawConn.Close()
+				return nil, NewTLSError("parse_ja3", host, port, "h1", parseErr)
 			}
+			// Force HTTP/1.1 ALPN in the spec
+			for _, ext := range spec.Extensions {
+				if alpn, ok := ext.(*utls.ALPNExtension); ok {
+					alpn.AlpnProtocols = []string{"http/1.1"}
+					break
+				}
+			}
+			tlsConn = utls.UClient(rawConn, tlsConfig, utls.HelloCustom)
+			if err := tlsConn.ApplyPreset(spec); err != nil {
+				rawConn.Close()
+				return nil, NewTLSError("apply_ja3_preset", host, port, "h1", err)
+			}
+		} else {
+			// Use preset's ClientHelloID directly
+			// Note: ClientHelloID includes ALPN with [h2, http/1.1], so we must modify it
+			tlsConn = utls.UClient(rawConn, tlsConfig, t.preset.ClientHelloID)
+			tlsConn.SetSessionCache(t.sessionCache)
+
+			// Build handshake state first - this populates Extensions from ClientHelloID
+			if err := tlsConn.BuildHandshakeState(); err != nil {
+				rawConn.Close()
+				return nil, NewTLSError("build_handshake", host, port, "h1", err)
+			}
+
+			// Force HTTP/1.1 only ALPN to prevent h2 negotiation
+			// Must be done AFTER BuildHandshakeState() which generates the extensions
+			for _, ext := range tlsConn.Extensions {
+				if alpn, ok := ext.(*utls.ALPNExtension); ok {
+					alpn.AlpnProtocols = []string{"http/1.1"}
+					break
+				}
+			}
+		}
+		// Only set session cache for preset path or custom JA3 with PSK extension.
+		// Setting session cache on a spec without PSK extension can cause handshake failures.
+		if t.config == nil || t.config.CustomJA3 == "" || ja3HasExtension(t.config.CustomJA3, "41") {
+			tlsConn.SetSessionCache(t.sessionCache)
 		}
 
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
@@ -527,17 +559,39 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 				}
 
 				// Redo TLS setup on the clean connection
-				tlsConn = utls.UClient(rawConn, tlsConfig, t.preset.ClientHelloID)
-				tlsConn.SetSessionCache(t.sessionCache)
-				if buildErr := tlsConn.BuildHandshakeState(); buildErr != nil {
-					rawConn.Close()
-					return nil, NewTLSError("build_handshake", host, port, "h1", buildErr)
-				}
-				for _, ext := range tlsConn.Extensions {
-					if alpn, ok := ext.(*utls.ALPNExtension); ok {
-						alpn.AlpnProtocols = []string{"http/1.1"}
-						break
+				if t.config != nil && t.config.CustomJA3 != "" {
+					spec, parseErr := fingerprint.ParseJA3(t.config.CustomJA3, t.config.CustomJA3Extras)
+					if parseErr != nil {
+						rawConn.Close()
+						return nil, NewTLSError("parse_ja3", host, port, "h1", parseErr)
 					}
+					for _, ext := range spec.Extensions {
+						if alpn, ok := ext.(*utls.ALPNExtension); ok {
+							alpn.AlpnProtocols = []string{"http/1.1"}
+							break
+						}
+					}
+					tlsConn = utls.UClient(rawConn, tlsConfig, utls.HelloCustom)
+					if applyErr := tlsConn.ApplyPreset(spec); applyErr != nil {
+						rawConn.Close()
+						return nil, NewTLSError("apply_ja3_preset", host, port, "h1", applyErr)
+					}
+				} else {
+					tlsConn = utls.UClient(rawConn, tlsConfig, t.preset.ClientHelloID)
+					if buildErr := tlsConn.BuildHandshakeState(); buildErr != nil {
+						rawConn.Close()
+						return nil, NewTLSError("build_handshake", host, port, "h1", buildErr)
+					}
+					for _, ext := range tlsConn.Extensions {
+						if alpn, ok := ext.(*utls.ALPNExtension); ok {
+							alpn.AlpnProtocols = []string{"http/1.1"}
+							break
+						}
+					}
+				}
+				// Only set session cache when not using custom JA3 without PSK extension
+				if t.config == nil || t.config.CustomJA3 == "" || ja3HasExtension(t.config.CustomJA3, "41") {
+					tlsConn.SetSessionCache(t.sessionCache)
 				}
 				if hsErr := tlsConn.HandshakeContext(ctx); hsErr != nil {
 					rawConn.Close()
@@ -584,6 +638,7 @@ func (t *HTTP1Transport) dialThroughSOCKS5(ctx context.Context, targetHost, targ
 	if t.localAddr != "" {
 		socks5Dialer.SetLocalAddr(t.localAddr)
 	}
+	socks5Dialer.Control = BuildDialerControl(&t.preset.TCPFingerprint)
 
 	targetAddr := net.JoinHostPort(targetHost, targetPort)
 	conn, err := socks5Dialer.DialContext(ctx, "tcp", targetAddr)
@@ -595,8 +650,8 @@ func (t *HTTP1Transport) dialThroughSOCKS5(ctx context.Context, targetHost, targ
 }
 
 // dialThroughHTTPProxy establishes a connection through an HTTP proxy using CONNECT.
-// By default, uses speculative TLS: sends CONNECT + ClientHello together to save one round-trip.
-// Can be disabled via TransportConfig.DisableSpeculativeTLS.
+// By default, uses the traditional blocking CONNECT flow. Speculative TLS (sending
+// CONNECT + ClientHello together) can be enabled via TransportConfig.EnableSpeculativeTLS.
 func (t *HTTP1Transport) dialThroughHTTPProxy(ctx context.Context, targetHost, targetPort string) (net.Conn, error) {
 	proxyURL, err := url.Parse(t.proxy.URL)
 	if err != nil {
@@ -628,6 +683,7 @@ func (t *HTTP1Transport) dialThroughHTTPProxy(ctx context.Context, targetHost, t
 		Timeout:   t.connectTimeout,
 		KeepAlive: 30 * time.Second,
 	}
+	SetDialerControl(dialer, &t.preset.TCPFingerprint)
 	if t.localAddr != "" {
 		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(t.localAddr)}
 	}
@@ -651,15 +707,14 @@ func (t *HTTP1Transport) dialThroughHTTPProxy(ctx context.Context, targetHost, t
 
 	connectReq += "Connection: keep-alive\r\n\r\n"
 
-	// Check if speculative TLS is disabled (explicitly or via blocklist)
-	if (t.config != nil && t.config.DisableSpeculativeTLS) || IsProxyNoSpeculative(t.proxy.URL) {
-		// Traditional flow: send CONNECT, wait for 200 OK, then return conn for TLS
-		return t.dialHTTPProxyBlocking(ctx, conn, connectReq)
+	// Use speculative TLS only when explicitly enabled and not on the blocklist
+	if t.config != nil && t.config.EnableSpeculativeTLS && !IsProxyNoSpeculative(t.proxy.URL) {
+		// Speculative TLS: send CONNECT + ClientHello together to save one round-trip
+		return NewSpeculativeConn(conn, connectReq), nil
 	}
 
-	// Speculative TLS: return a SpeculativeConn that will send CONNECT + ClientHello together
-	// This saves one round-trip by overlapping the CONNECT wait with TLS handshake start
-	return NewSpeculativeConn(conn, connectReq), nil
+	// Traditional flow: send CONNECT, wait for 200 OK, then return conn for TLS
+	return t.dialHTTPProxyBlocking(ctx, conn, connectReq)
 }
 
 // dialHTTPProxyBlockingFresh opens a new TCP connection to the proxy and performs
@@ -694,6 +749,7 @@ func (t *HTTP1Transport) dialHTTPProxyBlockingFresh(ctx context.Context, targetH
 		Timeout:   t.connectTimeout,
 		KeepAlive: 30 * time.Second,
 	}
+	SetDialerControl(dialer, &t.preset.TCPFingerprint)
 	if t.localAddr != "" {
 		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(t.localAddr)}
 	}
@@ -1026,6 +1082,7 @@ func (t *HTTP1Transport) writeHeadersInOrder(w *bufio.Writer, req *http.Request,
 		for _, v := range values {
 			fmt.Fprintf(w, "%s: %s\r\n", key, v)
 		}
+		written[key] = true
 	}
 
 	// Ensure Content-Length is written when body is present

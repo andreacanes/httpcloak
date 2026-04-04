@@ -61,21 +61,30 @@ using var session = new Session(
 - `Presets.Chrome143MacOS` - Chrome 143 on macOS
 - `Presets.Firefox133` - Firefox 133
 - `Presets.Safari18` - Safari 18
-- `Presets.IosChrome143` - Chrome on iOS
-- `Presets.AndroidChrome143` - Chrome on Android
+- `Presets.Chrome143Ios` - Chrome on iOS
+- `Presets.Chrome143Android` - Chrome on Android
 
 ## Cookie Management
 
 ```csharp
-// Set a cookie
+// Set a simple cookie (global, sent to all domains)
 session.SetCookie("session_id", "abc123");
 
-// Get all cookies
+// Set a domain-scoped cookie with full metadata
+session.SetCookie("auth", "token", domain: ".example.com", secure: true);
+
+// Get all cookies (returns List<Cookie> with full metadata)
 var cookies = session.GetCookies();
-foreach (var (name, value) in cookies)
+foreach (var cookie in cookies)
 {
-    Console.WriteLine($"{name}: {value}");
+    Console.WriteLine($"{cookie.Name}={cookie.Value} (domain: {cookie.Domain})");
 }
+
+// Delete a cookie
+session.DeleteCookie("session_id");
+
+// Clear all cookies
+session.ClearCookies();
 ```
 
 ## License

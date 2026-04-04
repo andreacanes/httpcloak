@@ -59,7 +59,7 @@ class SessionResumption
         else
         {
             Console.WriteLine("Creating new session...");
-            session = new Session(preset: Presets.Chrome143);
+            session = new Session(preset: Presets.Chrome145);
 
             // Warm up - this acquires TLS session tickets
             Console.WriteLine("Warming up session...");
@@ -87,7 +87,7 @@ class SessionResumption
         Console.WriteLine(new string('-', 50));
 
         // Create and warm up session
-        using var session = new Session(preset: Presets.Chrome143);
+        using var session = new Session(preset: Presets.Chrome145);
         session.Get("https://cloudflare.com/");
 
         // Export to string (store in Redis, database, etc.)
@@ -108,7 +108,7 @@ class SessionResumption
         Console.WriteLine("\n[3] Cross-Domain Warming");
         Console.WriteLine(new string('-', 50));
 
-        using var session = new Session(preset: Presets.Chrome143);
+        using var session = new Session(preset: Presets.Chrome145);
 
         // Warm up on cloudflare.com (safe, no bot detection)
         Console.WriteLine("Warming up on cloudflare.com...");
@@ -163,7 +163,7 @@ class SessionResumption
         }
 
         // Create new session and warm it up
-        var session = new Session(preset: Presets.Chrome143);
+        var session = new Session(preset: Presets.Chrome145);
 
         // Warm up on a neutral Cloudflare endpoint
         session.Get("https://cloudflare.com/cdn-cgi/trace");

@@ -189,6 +189,8 @@ func (t *Transport) doStreamHTTP1(ctx context.Context, req *Request) (*StreamRes
 		bodyReader = req.BodyReader
 	} else if len(req.Body) > 0 {
 		bodyReader = bytes.NewReader(req.Body)
+	} else if method == "POST" || method == "PUT" || method == "PATCH" {
+		bodyReader = bytes.NewReader([]byte{})
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
@@ -204,7 +206,7 @@ func (t *Transport) doStreamHTTP1(ctx context.Context, req *Request) (*StreamRes
 	}
 
 	// Set preset headers
-	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), effectiveTLSOnly, "h1")
+	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.getCustomPseudoOrder(), effectiveTLSOnly, "h1", req.Headers)
 
 	// Override with custom headers (multi-value support)
 	// Use Set for first value to replace preset headers, Add for additional values
@@ -286,6 +288,8 @@ func (t *Transport) doStreamHTTP2(ctx context.Context, req *Request) (*StreamRes
 		bodyReader = req.BodyReader
 	} else if len(req.Body) > 0 {
 		bodyReader = bytes.NewReader(req.Body)
+	} else if method == "POST" || method == "PUT" || method == "PATCH" {
+		bodyReader = bytes.NewReader([]byte{})
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
@@ -301,7 +305,7 @@ func (t *Transport) doStreamHTTP2(ctx context.Context, req *Request) (*StreamRes
 	}
 
 	// Set preset headers
-	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), effectiveTLSOnly, "h2")
+	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.getCustomPseudoOrder(), effectiveTLSOnly, "h2", req.Headers)
 
 	// Override with custom headers (multi-value support)
 	// Use Set for first value to replace preset headers, Add for additional values
@@ -383,6 +387,8 @@ func (t *Transport) doStreamHTTP3(ctx context.Context, req *Request) (*StreamRes
 		bodyReader = req.BodyReader
 	} else if len(req.Body) > 0 {
 		bodyReader = bytes.NewReader(req.Body)
+	} else if method == "POST" || method == "PUT" || method == "PATCH" {
+		bodyReader = bytes.NewReader([]byte{})
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
@@ -398,7 +404,7 @@ func (t *Transport) doStreamHTTP3(ctx context.Context, req *Request) (*StreamRes
 	}
 
 	// Set preset headers
-	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), effectiveTLSOnly, "h3")
+	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.getCustomPseudoOrder(), effectiveTLSOnly, "h3", req.Headers)
 
 	// Override with custom headers (multi-value support)
 	// Use Set for first value to replace preset headers, Add for additional values

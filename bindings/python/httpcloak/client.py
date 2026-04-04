@@ -30,7 +30,7 @@ from io import IOBase
 from pathlib import Path
 from threading import Lock
 from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Union
-from urllib.parse import urlencode, urlparse, urlunparse, parse_qs
+from urllib.parse import urlencode, quote
 
 
 # File type for files parameter
@@ -132,14 +132,29 @@ class Preset:
         session = httpcloak.Session(preset=httpcloak.Preset.FIREFOX_133)
 
     All available presets:
-        Desktop Chrome: CHROME_144, CHROME_144_WINDOWS, CHROME_144_LINUX, CHROME_144_MACOS
+        Desktop Chrome: CHROME_146, CHROME_146_WINDOWS, CHROME_146_LINUX, CHROME_146_MACOS
+                        CHROME_145, CHROME_145_WINDOWS, CHROME_145_LINUX, CHROME_145_MACOS
+                        CHROME_144, CHROME_144_WINDOWS, CHROME_144_LINUX, CHROME_144_MACOS
                         CHROME_143, CHROME_143_WINDOWS, CHROME_143_LINUX, CHROME_143_MACOS
                         CHROME_141, CHROME_133
-        Mobile Chrome: IOS_CHROME_143, IOS_CHROME_144, ANDROID_CHROME_143, ANDROID_CHROME_144
+        Mobile Chrome: CHROME_146_IOS, CHROME_145_IOS, CHROME_144_IOS, CHROME_143_IOS,
+                       CHROME_146_ANDROID, CHROME_145_ANDROID, CHROME_144_ANDROID, CHROME_143_ANDROID
         Firefox: FIREFOX_133
-        Safari: SAFARI_18, IOS_SAFARI_17, IOS_SAFARI_18
+        Safari: SAFARI_18, SAFARI_17_IOS, SAFARI_18_IOS
     """
-    # Chrome 144 (latest)
+    # Chrome 146 (latest)
+    CHROME_146 = "chrome-146"
+    CHROME_146_WINDOWS = "chrome-146-windows"
+    CHROME_146_LINUX = "chrome-146-linux"
+    CHROME_146_MACOS = "chrome-146-macos"
+
+    # Chrome 145
+    CHROME_145 = "chrome-145"
+    CHROME_145_WINDOWS = "chrome-145-windows"
+    CHROME_145_LINUX = "chrome-145-linux"
+    CHROME_145_MACOS = "chrome-145-macos"
+
+    # Chrome 144
     CHROME_144 = "chrome-144"
     CHROME_144_WINDOWS = "chrome-144-windows"
     CHROME_144_LINUX = "chrome-144-linux"
@@ -158,29 +173,48 @@ class Preset:
     CHROME_133 = "chrome-133"
 
     # Mobile Chrome
-    IOS_CHROME_143 = "ios-chrome-143"
-    IOS_CHROME_144 = "ios-chrome-144"
-    ANDROID_CHROME_143 = "android-chrome-143"
-    ANDROID_CHROME_144 = "android-chrome-144"
+    CHROME_143_IOS = "chrome-143-ios"
+    CHROME_144_IOS = "chrome-144-ios"
+    CHROME_145_IOS = "chrome-145-ios"
+    CHROME_146_IOS = "chrome-146-ios"
+    CHROME_143_ANDROID = "chrome-143-android"
+    CHROME_144_ANDROID = "chrome-144-android"
+    CHROME_145_ANDROID = "chrome-145-android"
+    CHROME_146_ANDROID = "chrome-146-android"
 
     # Firefox
     FIREFOX_133 = "firefox-133"
 
     # Safari (desktop and mobile)
     SAFARI_18 = "safari-18"
-    IOS_SAFARI_17 = "ios-safari-17"
-    IOS_SAFARI_18 = "ios-safari-18"
+    SAFARI_17_IOS = "safari-17-ios"
+    SAFARI_18_IOS = "safari-18-ios"
+
+    # Backwards compatibility aliases (old naming convention)
+    IOS_CHROME_143 = CHROME_143_IOS
+    IOS_CHROME_144 = CHROME_144_IOS
+    IOS_CHROME_145 = CHROME_145_IOS
+    IOS_CHROME_146 = CHROME_146_IOS
+    ANDROID_CHROME_143 = CHROME_143_ANDROID
+    ANDROID_CHROME_144 = CHROME_144_ANDROID
+    ANDROID_CHROME_145 = CHROME_145_ANDROID
+    ANDROID_CHROME_146 = CHROME_146_ANDROID
+    IOS_SAFARI_17 = SAFARI_17_IOS
+    IOS_SAFARI_18 = SAFARI_18_IOS
 
     @classmethod
     def all(cls) -> List[str]:
         """Return list of all available preset names."""
         return [
+            cls.CHROME_146, cls.CHROME_146_WINDOWS, cls.CHROME_146_LINUX, cls.CHROME_146_MACOS,
+            cls.CHROME_145, cls.CHROME_145_WINDOWS, cls.CHROME_145_LINUX, cls.CHROME_145_MACOS,
             cls.CHROME_144, cls.CHROME_144_WINDOWS, cls.CHROME_144_LINUX, cls.CHROME_144_MACOS,
             cls.CHROME_143, cls.CHROME_143_WINDOWS, cls.CHROME_143_LINUX, cls.CHROME_143_MACOS,
             cls.CHROME_141, cls.CHROME_133,
-            cls.IOS_CHROME_143, cls.IOS_CHROME_144, cls.ANDROID_CHROME_143, cls.ANDROID_CHROME_144,
+            cls.CHROME_146_IOS, cls.CHROME_145_IOS, cls.CHROME_144_IOS, cls.CHROME_143_IOS,
+            cls.CHROME_146_ANDROID, cls.CHROME_145_ANDROID, cls.CHROME_144_ANDROID, cls.CHROME_143_ANDROID,
             cls.FIREFOX_133,
-            cls.SAFARI_18, cls.IOS_SAFARI_17, cls.IOS_SAFARI_18,
+            cls.SAFARI_18, cls.SAFARI_17_IOS, cls.SAFARI_18_IOS,
         ]
 
 
@@ -945,8 +979,12 @@ def _setup_lib(lib):
     lib.httpcloak_request.restype = c_void_p
     lib.httpcloak_get_cookies.argtypes = [c_int64]
     lib.httpcloak_get_cookies.restype = c_void_p
-    lib.httpcloak_set_cookie.argtypes = [c_int64, c_char_p, c_char_p]
+    lib.httpcloak_set_cookie.argtypes = [c_int64, c_char_p]
     lib.httpcloak_set_cookie.restype = None
+    lib.httpcloak_delete_cookie.argtypes = [c_int64, c_char_p, c_char_p]
+    lib.httpcloak_delete_cookie.restype = None
+    lib.httpcloak_clear_cookies.argtypes = [c_int64]
+    lib.httpcloak_clear_cookies.restype = None
     lib.httpcloak_free_string.argtypes = [c_void_p]
     lib.httpcloak_free_string.restype = None
     lib.httpcloak_version.argtypes = []
@@ -1232,14 +1270,14 @@ def _parse_fast_response(lib, response_handle: int, elapsed: float = 0.0) -> Fas
 
 
 def _add_params_to_url(url: str, params: Optional[Dict[str, Any]]) -> str:
-    """Add query parameters to URL."""
+    """Add query parameters to URL, preserving insertion order and encoding."""
     if not params:
         return url
-    parsed = urlparse(url)
-    existing_params = parse_qs(parsed.query)
-    existing_params.update({k: [str(v)] for k, v in params.items()})
-    new_query = urlencode(existing_params, doseq=True)
-    return urlunparse(parsed._replace(query=new_query))
+    sep = '&' if '?' in url else '?'
+    parts = []
+    for k, v in params.items():
+        parts.append(f"{quote(str(k), safe='')}={quote(str(v), safe='')}")
+    return url + sep + '&'.join(parts)
 
 
 def _apply_auth(
@@ -1271,7 +1309,8 @@ def available_presets() -> dict:
 
     Returns a dict mapping preset names to their info:
         {
-            "chrome-144": {"protocols": ["h1", "h2", "h3"]},
+            "chrome-146": {"protocols": ["h1", "h2", "h3"]},
+            "chrome-145": {"protocols": ["h1", "h2", "h3"]},
             "firefox-133": {"protocols": ["h1", "h2"]},
             ...
         }
@@ -1355,7 +1394,7 @@ class Session:
     API is compatible with requests.Session.
 
     Args:
-        preset: Browser preset (default: "chrome-144")
+        preset: Browser preset (default: "chrome-146")
         proxy: Proxy URL (e.g., "http://user:pass@host:port" or "socks5://host:port")
         tcp_proxy: Proxy URL for TCP protocols (HTTP/1.1, HTTP/2) - use with udp_proxy for split config
         udp_proxy: Proxy URL for UDP protocols (HTTP/3 via MASQUE) - use with tcp_proxy for split config
@@ -1375,9 +1414,9 @@ class Session:
         quic_idle_timeout: QUIC connection idle timeout in seconds (default: 30). Set higher for long-lived H3 connections.
         local_address: Local IP address to bind outgoing connections to (e.g., "192.168.1.100" or "::1")
         key_log_file: Path to write TLS key log (NSS format) for Wireshark decryption
-        disable_speculative_tls: Disable speculative TLS optimization for proxy connections (default: False).
-            When False, CONNECT and TLS ClientHello are sent together saving one round-trip.
-            Set to True if you experience issues with certain proxies.
+        enable_speculative_tls: Enable speculative TLS optimization for proxy connections (default: False).
+            When True, CONNECT and TLS ClientHello are sent together saving one round-trip.
+            May cause issues with certain proxies or debugging tools.
 
     Example:
         with httpcloak.Session(preset="chrome-143") as session:
@@ -1408,7 +1447,7 @@ class Session:
 
     def __init__(
         self,
-        preset: str = "chrome-144",
+        preset: str = "chrome-146",
         proxy: Optional[str] = None,
         tcp_proxy: Optional[str] = None,
         udp_proxy: Optional[str] = None,
@@ -1429,8 +1468,16 @@ class Session:
         quic_idle_timeout: int = 0,
         local_address: Optional[str] = None,
         key_log_file: Optional[str] = None,
-        disable_speculative_tls: bool = False,
+        enable_speculative_tls: bool = False,
         switch_protocol: Optional[str] = None,
+        ja3: Optional[str] = None,
+        akamai: Optional[str] = None,
+        extra_fp: Optional[Dict[str, any]] = None,
+        tcp_ttl: Optional[int] = None,
+        tcp_mss: Optional[int] = None,
+        tcp_window_size: Optional[int] = None,
+        tcp_window_scale: Optional[int] = None,
+        tcp_df: Optional[bool] = None,
     ):
         self._lib = _get_lib()
         self._default_timeout = timeout
@@ -1472,10 +1519,26 @@ class Session:
             config["local_address"] = local_address
         if key_log_file:
             config["key_log_file"] = key_log_file
-        if disable_speculative_tls:
-            config["disable_speculative_tls"] = True
+        if enable_speculative_tls:
+            config["enable_speculative_tls"] = True
         if switch_protocol:
             config["switch_protocol"] = switch_protocol
+        if ja3:
+            config["ja3"] = ja3
+        if akamai:
+            config["akamai"] = akamai
+        if extra_fp:
+            config["extra_fp"] = extra_fp
+        if tcp_ttl is not None:
+            config["tcp_ttl"] = tcp_ttl
+        if tcp_mss is not None:
+            config["tcp_mss"] = tcp_mss
+        if tcp_window_size is not None:
+            config["tcp_window_size"] = tcp_window_size
+        if tcp_window_scale is not None:
+            config["tcp_window_scale"] = tcp_window_scale
+        if tcp_df is not None:
+            config["tcp_df"] = tcp_df
 
         config_json = json.dumps(config).encode("utf-8")
         self._handle = self._lib.httpcloak_session_new(config_json)
@@ -1998,6 +2061,7 @@ class Session:
         url: str,
         data: Union[str, bytes, Dict, None] = None,
         json_data: Optional[Dict] = None,
+        files: Optional[FilesType] = None,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
@@ -2010,6 +2074,7 @@ class Session:
             url: Request URL
             data: Request body (string, bytes, or dict for form data)
             json_data: JSON body (will be serialized)
+            files: Files to upload as multipart/form-data
             params: URL query parameters
             headers: Request headers
             cookies: Cookies to send with this request
@@ -2019,7 +2084,12 @@ class Session:
         merged_headers = self._merge_headers(headers)
 
         body = None
-        if json_data is not None:
+        if files is not None:
+            form_data = data if isinstance(data, dict) else None
+            body, content_type = _encode_multipart(data=form_data, files=files)
+            merged_headers = merged_headers or {}
+            merged_headers["Content-Type"] = content_type
+        elif json_data is not None:
             body = json.dumps(json_data).encode("utf-8")
             merged_headers = merged_headers or {}
             merged_headers.setdefault("Content-Type", "application/json")
@@ -2064,6 +2134,7 @@ class Session:
         url: str,
         data: Union[str, bytes, Dict, None] = None,
         json_data: Optional[Dict] = None,
+        files: Optional[FilesType] = None,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
@@ -2077,6 +2148,7 @@ class Session:
             url: Request URL
             data: Request body
             json_data: JSON body (will be serialized)
+            files: Files to upload as multipart/form-data
             params: URL query parameters
             headers: Request headers
             cookies: Cookies to send with this request
@@ -2086,7 +2158,13 @@ class Session:
         merged_headers = self._merge_headers(headers)
 
         body = None
-        if json_data is not None:
+        if files is not None:
+            form_data = data if isinstance(data, dict) else None
+            body_bytes, content_type = _encode_multipart(data=form_data, files=files)
+            body = body_bytes.decode("latin-1")
+            merged_headers = merged_headers or {}
+            merged_headers["Content-Type"] = content_type
+        elif json_data is not None:
             body = json.dumps(json_data)
             merged_headers = merged_headers or {}
             merged_headers.setdefault("Content-Type", "application/json")
@@ -2151,17 +2229,73 @@ class Session:
     # Cookie Management
     # =========================================================================
 
-    def get_cookies(self) -> Dict[str, str]:
-        """Get all cookies from the session."""
+    def get_cookies_detailed(self) -> "List[Cookie]":
+        """Get all cookies from the session with full metadata (domain, path, expiry, flags)."""
         result_ptr = self._lib.httpcloak_get_cookies(self._handle)
         result = _ptr_to_string(result_ptr)
         if result:
-            return json.loads(result)
-        return {}
+            parsed = json.loads(result)
+            return [
+                Cookie(
+                    name=c.get("name", ""),
+                    value=c.get("value", ""),
+                    domain=c.get("domain", ""),
+                    path=c.get("path", ""),
+                    expires=c.get("expires", ""),
+                    max_age=c.get("max_age", 0),
+                    secure=c.get("secure", False),
+                    http_only=c.get("http_only", False),
+                    same_site=c.get("same_site", ""),
+                )
+                for c in parsed
+            ]
+        return []
+
+    def get_cookies(self) -> Dict[str, str]:
+        """
+        Get all cookies as a flat name-value dict.
+
+        .. deprecated::
+            In a future release, this method will return ``List[Cookie]`` with full metadata,
+            same as :meth:`get_cookies_detailed`.
+        """
+        if not getattr(Session, "_get_cookies_warned", False):
+            Session._get_cookies_warned = True
+            import warnings
+            warnings.warn(
+                "get_cookies() currently returns a flat {name: value} dict. "
+                "In a future release, it will return List[Cookie] with full metadata "
+                "(domain, path, expiry, etc.), same as get_cookies_detailed(). "
+                "Update your code accordingly.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        cookies = self.get_cookies_detailed()
+        return {c.name: c.value for c in cookies}
+
+    def get_cookie_detailed(self, name: str) -> "Optional[Cookie]":
+        """
+        Get a specific cookie by name with full metadata.
+
+        Args:
+            name: Cookie name
+
+        Returns:
+            Cookie object or None if not found
+        """
+        cookies = self.get_cookies_detailed()
+        for c in cookies:
+            if c.name == name:
+                return c
+        return None
 
     def get_cookie(self, name: str) -> Optional[str]:
         """
-        Get a specific cookie by name.
+        Get a specific cookie value by name.
+
+        .. deprecated::
+            In a future release, this method will return ``Optional[Cookie]`` with full metadata,
+            same as :meth:`get_cookie_detailed`.
 
         Args:
             name: Cookie name
@@ -2169,44 +2303,89 @@ class Session:
         Returns:
             Cookie value or None if not found
         """
-        cookies = self.get_cookies()
-        return cookies.get(name)
+        if not getattr(Session, "_get_cookie_warned", False):
+            Session._get_cookie_warned = True
+            import warnings
+            warnings.warn(
+                "get_cookie() currently returns a string value. "
+                "In a future release, it will return a Cookie object with full metadata "
+                "(domain, path, expiry, etc.), same as get_cookie_detailed(). "
+                "Update your code accordingly.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        cookie = self.get_cookie_detailed(name)
+        return cookie.value if cookie else None
 
-    def set_cookie(self, name: str, value: str):
-        """Set a cookie in the session."""
+    def set_cookie(
+        self,
+        name: str,
+        value: str,
+        domain: str = "",
+        path: str = "/",
+        secure: bool = False,
+        http_only: bool = False,
+        same_site: str = "",
+        max_age: int = 0,
+        expires: "Optional[str]" = None,
+    ):
+        """
+        Set a cookie in the session.
+
+        Args:
+            name: Cookie name
+            value: Cookie value
+            domain: Cookie domain (empty = global cookie sent to all domains)
+            path: Cookie path (default: "/")
+            secure: Secure flag
+            http_only: HttpOnly flag
+            same_site: SameSite attribute (Strict, Lax, None)
+            max_age: Max age in seconds (0 means not set)
+            expires: Expiration date in RFC1123 format (e.g. "Mon, 02 Jan 2006 15:04:05 GMT")
+        """
+        cookie = {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": path,
+            "secure": secure,
+            "http_only": http_only,
+            "same_site": same_site,
+            "max_age": max_age,
+        }
+        if expires:
+            cookie["expires"] = expires
         self._lib.httpcloak_set_cookie(
             self._handle,
-            name.encode("utf-8"),
-            value.encode("utf-8"),
+            json.dumps(cookie).encode("utf-8"),
         )
 
-    def delete_cookie(self, name: str):
+    def delete_cookie(self, name: str, domain: str = ""):
         """
         Delete a specific cookie by name.
 
-        Note: This sets the cookie to an empty value with immediate expiry.
-        The cookie will not be sent in subsequent requests.
+        Args:
+            name: Cookie name to delete
+            domain: Domain to delete from (empty = delete from all domains)
         """
-        # Set cookie to empty value - effectively deletes it
-        self._lib.httpcloak_set_cookie(
+        self._lib.httpcloak_delete_cookie(
             self._handle,
             name.encode("utf-8"),
-            b"",
+            domain.encode("utf-8"),
         )
 
     def clear_cookies(self):
-        """
-        Clear all cookies from the session.
-
-        Note: This deletes all cookies by setting them to empty values.
-        """
-        cookies = self.get_cookies()
-        for name in cookies:
-            self.delete_cookie(name)
+        """Clear all cookies from the session."""
+        self._lib.httpcloak_clear_cookies(self._handle)
 
     @property
     def cookies(self) -> Dict[str, str]:
-        """Get cookies as a property."""
+        """
+        Get cookies as a flat name-value dict.
+
+        .. deprecated::
+            Will return ``List[Cookie]`` with full metadata in a future release.
+        """
         return self.get_cookies()
 
     # =========================================================================
@@ -3321,7 +3500,7 @@ _default_config: Dict[str, Any] = {}
 
 
 def configure(
-    preset: str = "chrome-144",
+    preset: str = "chrome-146",
     headers: Optional[Dict[str, str]] = None,
     auth: Optional[Tuple[str, str]] = None,
     proxy: Optional[str] = None,
@@ -3341,7 +3520,7 @@ def configure(
     All subsequent calls to httpcloak.get(), httpcloak.post(), etc. will use these defaults.
 
     Args:
-        preset: Browser preset (default: "chrome-144")
+        preset: Browser preset (default: "chrome-146")
         headers: Default headers for all requests
         auth: Default basic auth tuple (username, password)
         proxy: Proxy URL (e.g., "http://user:pass@host:port")
@@ -3440,7 +3619,7 @@ class LocalProxy:
     def __init__(
         self,
         port: int = 0,
-        preset: str = "chrome-144",
+        preset: str = "chrome-146",
         timeout: int = 30,
         max_connections: int = 1000,
         tcp_proxy: Optional[str] = None,
@@ -3452,7 +3631,7 @@ class LocalProxy:
 
         Args:
             port: Port to listen on (0 = auto-select available port)
-            preset: Browser fingerprint preset (default: "chrome-144")
+            preset: Browser fingerprint preset (default: "chrome-146")
             timeout: Request timeout in seconds (default: 30)
             max_connections: Maximum concurrent connections (default: 1000)
             tcp_proxy: Default upstream TCP proxy URL (can be overridden per-request)
@@ -3967,7 +4146,7 @@ def _get_default_session() -> Session:
     if _default_session is None:
         with _default_session_lock:
             if _default_session is None:
-                preset = _default_config.get("preset", "chrome-144")
+                preset = _default_config.get("preset", "chrome-146")
                 proxy = _default_config.get("proxy")
                 timeout = _default_config.get("timeout", 30)
                 http_version = _default_config.get("http_version", "auto")
@@ -4030,7 +4209,7 @@ def _get_session_for_request(kwargs: dict) -> Tuple[Session, bool]:
         return _get_default_session(), False
 
     # Get current defaults and apply overrides
-    final_preset = preset if preset is not None else _default_config.get("preset", "chrome-144")
+    final_preset = preset if preset is not None else _default_config.get("preset", "chrome-146")
     final_proxy = proxy if proxy is not None else _default_config.get("proxy")
     final_tcp_proxy = tcp_proxy if tcp_proxy is not None else _default_config.get("tcp_proxy")
     final_udp_proxy = udp_proxy if udp_proxy is not None else _default_config.get("udp_proxy")

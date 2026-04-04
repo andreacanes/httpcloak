@@ -195,7 +195,7 @@ export class StreamResponse {
 }
 
 export interface SessionOptions {
-  /** Browser preset to use (default: "chrome-144") */
+  /** Browser preset to use (default: "chrome-146") */
   preset?: string;
   /** Proxy URL (e.g., "http://user:pass@host:port" or "socks5://host:port") */
   proxy?: string;
@@ -239,6 +239,16 @@ export interface SessionOptions {
   keyLogFile?: string;
   /** Disable internal cookie jar - cookies are managed externally via headers (default: false) */
   withoutCookieJar?: boolean;
+  /** Enable speculative TLS optimization for proxy connections (default: false) */
+  enableSpeculativeTls?: boolean;
+  /** Protocol to switch to after Refresh() (e.g., "h1", "h2", "h3") */
+  switchProtocol?: string;
+  /** Custom JA3 fingerprint string (e.g., "771,4865-4866-4867-...,0-23-65281-...,29-23-24,0") */
+  ja3?: string;
+  /** Custom Akamai HTTP/2 fingerprint string (e.g., "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p") */
+  akamai?: string;
+  /** Extra fingerprint options: { tls_alpn, tls_signature_algorithms, tls_cert_compression, tls_permute_extensions } */
+  extraFp?: Record<string, any>;
 }
 
 export interface RequestOptions {
@@ -329,22 +339,50 @@ export class Session {
   options(url: string, options?: RequestOptions): Promise<Response>;
 
   // Cookie management
-  /** Get all cookies from the session */
+
+  /** Get all cookies with full metadata (domain, path, expiry, flags) */
+  getCookiesDetailed(): Cookie[];
+
+  /** Get a specific cookie by name with full metadata */
+  getCookieDetailed(name: string): Cookie | null;
+
+  /**
+   * Get all cookies as a flat name-value object.
+   * @deprecated Will return Cookie[] with full metadata in a future release. Use getCookiesDetailed() for the new format now.
+   */
   getCookies(): Record<string, string>;
 
-  /** Get a specific cookie by name */
+  /**
+   * Get a specific cookie value by name.
+   * @deprecated Will return Cookie|null in a future release. Use getCookieDetailed() for the new format now.
+   */
   getCookie(name: string): string | null;
 
   /** Set a cookie in the session */
-  setCookie(name: string, value: string): void;
+  setCookie(
+    name: string,
+    value: string,
+    options?: {
+      domain?: string;
+      path?: string;
+      secure?: boolean;
+      httpOnly?: boolean;
+      sameSite?: string;
+      maxAge?: number;
+      expires?: string;
+    }
+  ): void;
 
-  /** Delete a specific cookie by name */
-  deleteCookie(name: string): void;
+  /** Delete a specific cookie by name. If domain is omitted, deletes from all domains. */
+  deleteCookie(name: string, domain?: string): void;
 
   /** Clear all cookies from the session */
   clearCookies(): void;
 
-  /** Get cookies as a property */
+  /**
+   * Get cookies as a property.
+   * @deprecated Will return Cookie[] with full metadata in a future release.
+   */
   readonly cookies: Record<string, string>;
 
   // Proxy management
@@ -611,7 +649,7 @@ export class Session {
 export interface LocalProxyOptions {
   /** Port to listen on (default: 0 for auto-assign) */
   port?: number;
-  /** Browser preset to use (default: "chrome-144") */
+  /** Browser preset to use (default: "chrome-146") */
   preset?: string;
   /** Request timeout in seconds (default: 30) */
   timeout?: number;
@@ -651,7 +689,7 @@ export interface LocalProxyStats {
  *
  * @example
  * // Basic usage
- * const proxy = new LocalProxy({ preset: "chrome-144", tlsOnly: true });
+ * const proxy = new LocalProxy({ preset: "chrome-146", tlsOnly: true });
  * console.log(`Proxy running on ${proxy.proxyUrl}`);
  * // Use with any HTTP client pointing to the proxy
  * proxy.close();
@@ -808,22 +846,45 @@ export function request(method: string, url: string, options?: RequestOptions): 
 
 /** Available browser presets */
 export const Preset: {
+  CHROME_146: string;
+  CHROME_146_WINDOWS: string;
+  CHROME_146_LINUX: string;
+  CHROME_146_MACOS: string;
+  CHROME_145: string;
+  CHROME_145_WINDOWS: string;
+  CHROME_145_LINUX: string;
+  CHROME_145_MACOS: string;
+  CHROME_144: string;
+  CHROME_144_WINDOWS: string;
+  CHROME_144_LINUX: string;
+  CHROME_144_MACOS: string;
   CHROME_143: string;
   CHROME_143_WINDOWS: string;
   CHROME_143_LINUX: string;
   CHROME_143_MACOS: string;
   CHROME_141: string;
   CHROME_133: string;
-  CHROME_131: string;
-  CHROME_131_WINDOWS: string;
-  CHROME_131_LINUX: string;
-  CHROME_131_MACOS: string;
-  IOS_CHROME_143: string;
-  IOS_CHROME_144: string;
-  ANDROID_CHROME_143: string;
-  ANDROID_CHROME_144: string;
+  CHROME_143_IOS: string;
+  CHROME_144_IOS: string;
+  CHROME_145_IOS: string;
+  CHROME_146_IOS: string;
+  CHROME_143_ANDROID: string;
+  CHROME_144_ANDROID: string;
+  CHROME_145_ANDROID: string;
+  CHROME_146_ANDROID: string;
   FIREFOX_133: string;
   SAFARI_18: string;
+  SAFARI_17_IOS: string;
+  SAFARI_18_IOS: string;
+  // Backwards compatibility aliases
+  IOS_CHROME_143: string;
+  IOS_CHROME_144: string;
+  IOS_CHROME_145: string;
+  IOS_CHROME_146: string;
+  ANDROID_CHROME_143: string;
+  ANDROID_CHROME_144: string;
+  ANDROID_CHROME_145: string;
+  ANDROID_CHROME_146: string;
   IOS_SAFARI_17: string;
   IOS_SAFARI_18: string;
   all(): string[];

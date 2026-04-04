@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -106,8 +107,11 @@ func NewHTTP2TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 	crand.Read(seedBytes[:])
 	shuffleSeed := int64(binary.LittleEndian.Uint64(seedBytes[:]))
 
-	// Check if PSK spec is available for this preset
+	// Check if PSK spec is available for this preset or custom JA3
 	hasPSKSpec := preset.PSKClientHelloID.Client != ""
+	if !hasPSKSpec && config != nil && config.CustomJA3 != "" {
+		hasPSKSpec = ja3HasExtension(config.CustomJA3, "41")
+	}
 
 	t := &HTTP2Transport{
 		preset:         preset,
@@ -215,6 +219,10 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key string) (*persistentConn, error) {
 	// Try to get existing connection
 	t.connsMu.RLock()
+	if t.closed {
+		t.connsMu.RUnlock()
+		return nil, fmt.Errorf("http2: transport closed")
+	}
 	conn, exists := t.conns[key]
 	t.connsMu.RUnlock()
 
@@ -224,6 +232,10 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 
 	// Need to create new connection — verify under write lock first
 	t.connsMu.Lock()
+	if t.closed {
+		t.connsMu.Unlock()
+		return nil, fmt.Errorf("http2: transport closed")
+	}
 
 	// Double-check after acquiring write lock
 	if conn, exists = t.conns[key]; exists && t.isConnUsable(conn) {
@@ -247,6 +259,11 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 
 	// Store the new connection
 	t.connsMu.Lock()
+	if t.closed {
+		t.connsMu.Unlock()
+		go newConn.close()
+		return nil, fmt.Errorf("http2: transport closed")
+	}
 	// Another goroutine may have created a conn while we were dialing
 	if existingConn, ok := t.conns[key]; ok && t.isConnUsable(existingConn) {
 		t.connsMu.Unlock()
@@ -316,6 +333,7 @@ func (t *HTTP2Transport) createConn(ctx context.Context, host, port string) (*pe
 			Timeout:   t.connectTimeout,
 			KeepAlive: 30 * time.Second,
 		}
+		SetDialerControl(dialer, &t.preset.TCPFingerprint)
 		if t.localAddr != "" {
 			localIP := net.ParseIP(t.localAddr)
 			dialer.LocalAddr = &net.TCPAddr{IP: localIP}
@@ -383,7 +401,15 @@ func (t *HTTP2Transport) createConn(ctx context.Context, host, port string) (*pe
 	// utls's ApplyPreset mutates the spec (clears KeyShares.Data, etc.), so each
 	// connection needs its own copy. Use same shuffleSeed for consistent ordering.
 	var specToUse *utls.ClientHelloSpec
-	if t.hasPSKSpec {
+	if t.config != nil && t.config.CustomJA3 != "" {
+		// Custom JA3: parse to fresh spec each connection (ApplyPreset mutates)
+		spec, parseErr := fingerprint.ParseJA3(t.config.CustomJA3, t.config.CustomJA3Extras)
+		if parseErr != nil {
+			rawConn.Close()
+			return nil, fmt.Errorf("failed to parse custom JA3: %w", parseErr)
+		}
+		specToUse = spec
+	} else if t.hasPSKSpec {
 		// Generate fresh PSK spec for this connection
 		if spec, err := utls.UTLSIdToSpecWithSeed(t.preset.PSKClientHelloID, t.shuffleSeed); err == nil {
 			specToUse = &spec
@@ -480,7 +506,14 @@ func (t *HTTP2Transport) createConn(ctx context.Context, host, port string) (*pe
 
 			// Regenerate fresh TLS spec (the previous one was consumed)
 			var fallbackSpec *utls.ClientHelloSpec
-			if t.hasPSKSpec {
+			if t.config != nil && t.config.CustomJA3 != "" {
+				spec, parseErr := fingerprint.ParseJA3(t.config.CustomJA3, t.config.CustomJA3Extras)
+				if parseErr != nil {
+					rawConn.Close()
+					return nil, fmt.Errorf("speculative TLS fallback: failed to parse custom JA3: %w", parseErr)
+				}
+				fallbackSpec = spec
+			} else if t.hasPSKSpec {
 				if spec, specErr := utls.UTLSIdToSpecWithSeed(t.preset.PSKClientHelloID, t.shuffleSeed); specErr == nil {
 					fallbackSpec = &spec
 				}
@@ -541,6 +574,40 @@ alpnCheck:
 		userAgent = "" // Don't set default User-Agent in TLS-only mode
 	}
 
+	// Build SETTINGS map and order dynamically to include all non-zero settings
+	h2Settings := map[http2.SettingID]uint32{
+		http2.SettingHeaderTableSize:   settings.HeaderTableSize,
+		http2.SettingEnablePush:        boolToUint32(settings.EnablePush),
+		http2.SettingInitialWindowSize: settings.InitialWindowSize,
+		http2.SettingMaxHeaderListSize: settings.MaxHeaderListSize,
+	}
+	h2SettingsOrder := []http2.SettingID{
+		http2.SettingHeaderTableSize,
+		http2.SettingEnablePush,
+		http2.SettingInitialWindowSize,
+		http2.SettingMaxHeaderListSize,
+	}
+	if settings.MaxConcurrentStreams > 0 {
+		h2Settings[http2.SettingMaxConcurrentStreams] = settings.MaxConcurrentStreams
+		h2SettingsOrder = append(h2SettingsOrder, http2.SettingMaxConcurrentStreams)
+	}
+	if settings.MaxFrameSize > 0 {
+		h2Settings[http2.SettingMaxFrameSize] = settings.MaxFrameSize
+		h2SettingsOrder = append(h2SettingsOrder, http2.SettingMaxFrameSize)
+	}
+	if settings.NoRFC7540Priorities {
+		h2Settings[http2.SettingNoRFC7540Priorities] = 1
+		h2SettingsOrder = append(h2SettingsOrder, http2.SettingNoRFC7540Priorities)
+	}
+
+	// Pseudo-header order: use custom (Akamai), or browser-type heuristic
+	pseudoOrder := []string{":method", ":authority", ":scheme", ":path"} // Chrome default
+	if t.config != nil && len(t.config.CustomPseudoOrder) > 0 {
+		pseudoOrder = t.config.CustomPseudoOrder
+	} else if settings.NoRFC7540Priorities {
+		pseudoOrder = []string{":method", ":scheme", ":path", ":authority"} // Safari order
+	}
+
 	// Create HTTP/2 transport with native fingerprinting (no frame interception needed)
 	h2Transport := &http2.Transport{
 		AllowHTTP:                  false,
@@ -550,25 +617,23 @@ alpnCheck:
 		PingTimeout:                15 * time.Second,
 
 		// Native fingerprinting via sardanioss/net
-		ConnectionFlow: settings.ConnectionWindowUpdate,
-		Settings: map[http2.SettingID]uint32{
-			http2.SettingHeaderTableSize:   settings.HeaderTableSize,
-			http2.SettingEnablePush:        boolToUint32(settings.EnablePush),
-			http2.SettingInitialWindowSize: settings.InitialWindowSize,
-			http2.SettingMaxHeaderListSize: settings.MaxHeaderListSize,
-		},
-		SettingsOrder: []http2.SettingID{
-			http2.SettingHeaderTableSize,
-			http2.SettingEnablePush,
-			http2.SettingInitialWindowSize,
-			http2.SettingMaxHeaderListSize,
-		},
-		PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"}, // Chrome order (m,a,s,p)
-		HeaderPriority: &http2.PriorityParam{
-			Weight:    uint8(settings.StreamWeight - 1), // Wire format is weight-1
-			Exclusive: settings.StreamExclusive,
-			StreamDep: 0,
-		},
+		ConnectionFlow:     settings.ConnectionWindowUpdate,
+		Settings:           h2Settings,
+		SettingsOrder:      h2SettingsOrder,
+		DisableCookieSplit: true, // Chrome sends cookies as one HPACK entry, not split per RFC 9113
+		PseudoHeaderOrder: pseudoOrder,
+		HeaderPriority: func() *http2.PriorityParam {
+			// Chrome 120+ uses RFC 9218 extensible priorities (priority: header)
+			// instead of RFC 7540 PRIORITY frames. StreamWeight=0 means no PRIORITY data.
+			if settings.StreamWeight > 0 {
+				return &http2.PriorityParam{
+					Weight:    uint8(settings.StreamWeight - 1), // Wire format is weight-1
+					Exclusive: settings.StreamExclusive,
+					StreamDep: 0,
+				}
+			}
+			return nil
+		}(),
 		HeaderOrder: []string{
 			// Chrome 143 header order (verified via tls.peet.ws)
 			"cache-control", // appears on reload/session resumption
@@ -584,6 +649,7 @@ alpnCheck:
 		UserAgent:           userAgent,
 		StreamPriorityMode:  http2.StreamPriorityChrome,
 		HPACKIndexingPolicy: hpack.IndexingChrome,
+		HPACKNeverIndex:     []string{"cookie", "authorization", "proxy-authorization"},
 	}
 
 	h2Conn, err := h2Transport.NewClientConn(tlsConn)
@@ -632,6 +698,7 @@ func (t *HTTP2Transport) dialThroughSOCKS5(ctx context.Context, targetHost, targ
 	if t.localAddr != "" {
 		socks5Dialer.SetLocalAddr(t.localAddr)
 	}
+	socks5Dialer.Control = BuildDialerControl(&t.preset.TCPFingerprint)
 
 	targetAddr := net.JoinHostPort(targetHost, targetPort)
 	conn, err := socks5Dialer.DialContext(ctx, "tcp", targetAddr)
@@ -643,8 +710,8 @@ func (t *HTTP2Transport) dialThroughSOCKS5(ctx context.Context, targetHost, targ
 }
 
 // dialThroughHTTPProxy establishes a connection through an HTTP proxy using CONNECT.
-// By default, uses speculative TLS: sends CONNECT + ClientHello together to save one round-trip.
-// Can be disabled via TransportConfig.DisableSpeculativeTLS.
+// By default, uses the traditional blocking CONNECT flow. Speculative TLS (sending
+// CONNECT + ClientHello together) can be enabled via TransportConfig.EnableSpeculativeTLS.
 func (t *HTTP2Transport) dialThroughHTTPProxy(ctx context.Context, targetHost, targetPort string) (net.Conn, error) {
 	// Parse proxy URL
 	proxyURL, err := url.Parse(t.proxy.URL)
@@ -679,6 +746,7 @@ func (t *HTTP2Transport) dialThroughHTTPProxy(ctx context.Context, targetHost, t
 		Timeout:   t.connectTimeout,
 		KeepAlive: 30 * time.Second,
 	}
+	SetDialerControl(dialer, &t.preset.TCPFingerprint)
 	if t.localAddr != "" {
 		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(t.localAddr)}
 	}
@@ -701,15 +769,14 @@ func (t *HTTP2Transport) dialThroughHTTPProxy(ctx context.Context, targetHost, t
 
 	connectReq += "\r\n"
 
-	// Check if speculative TLS is disabled (explicitly or via blocklist)
-	if (t.config != nil && t.config.DisableSpeculativeTLS) || IsProxyNoSpeculative(t.proxy.URL) {
-		// Traditional flow: send CONNECT, wait for 200 OK, then return conn for TLS
-		return t.dialHTTPProxyBlocking(ctx, conn, connectReq)
+	// Use speculative TLS only when explicitly enabled and not on the blocklist
+	if t.config != nil && t.config.EnableSpeculativeTLS && !IsProxyNoSpeculative(t.proxy.URL) {
+		// Speculative TLS: send CONNECT + ClientHello together to save one round-trip
+		return NewSpeculativeConn(conn, connectReq), nil
 	}
 
-	// Speculative TLS: return a SpeculativeConn that will send CONNECT + ClientHello together
-	// This saves one round-trip by overlapping the CONNECT wait with TLS handshake start
-	return NewSpeculativeConn(conn, connectReq), nil
+	// Traditional flow: send CONNECT, wait for 200 OK, then return conn for TLS
+	return t.dialHTTPProxyBlocking(ctx, conn, connectReq)
 }
 
 // dialHTTPProxyBlockingFresh opens a new TCP connection to the proxy and performs
@@ -744,6 +811,7 @@ func (t *HTTP2Transport) dialHTTPProxyBlockingFresh(ctx context.Context, targetH
 		Timeout:   t.connectTimeout,
 		KeepAlive: 30 * time.Second,
 	}
+	SetDialerControl(dialer, &t.preset.TCPFingerprint)
 	if t.localAddr != "" {
 		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(t.localAddr)}
 	}
@@ -1072,6 +1140,10 @@ func (t *HTTP2Transport) Connect(ctx context.Context, host, port string) error {
 
 	// Check if we already have a usable connection
 	t.connsMu.RLock()
+	if t.closed {
+		t.connsMu.RUnlock()
+		return fmt.Errorf("http2: transport closed")
+	}
 	existingConn, exists := t.conns[key]
 	t.connsMu.RUnlock()
 
@@ -1087,6 +1159,11 @@ func (t *HTTP2Transport) Connect(ctx context.Context, host, port string) error {
 
 	// Store connection for reuse
 	t.connsMu.Lock()
+	if t.closed {
+		t.connsMu.Unlock()
+		go conn.close()
+		return fmt.Errorf("http2: transport closed")
+	}
 	// Check again in case another goroutine created one
 	if oldConn, exists := t.conns[key]; exists {
 		// Close the old one if not usable
@@ -1111,4 +1188,18 @@ func boolToUint32(b bool) uint32 {
 		return 1
 	}
 	return 0
+}
+
+// ja3HasExtension checks if a JA3 string contains a specific extension ID.
+func ja3HasExtension(ja3, extID string) bool {
+	parts := strings.Split(ja3, ",")
+	if len(parts) < 3 {
+		return false
+	}
+	for _, id := range strings.Split(parts[2], "-") {
+		if strings.TrimSpace(id) == extID {
+			return true
+		}
+	}
+	return false
 }

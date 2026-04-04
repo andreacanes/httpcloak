@@ -34,7 +34,7 @@ temp/
 # Test binaries (in root)
 /test_cloudflare
 /test_fingerprint
-/tests
+tests/
 # Internal tests (not published)
 internal_tests/
 
@@ -51,6 +51,9 @@ image copy*.png
 
 # Plans/notes directory
 plans/
+
+# Internal documentation (not published)
+internal_docs/
 
 # Test files with credentials
 cmd/

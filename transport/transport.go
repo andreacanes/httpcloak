@@ -149,10 +149,31 @@ type TransportConfig struct {
 	// If nil, falls back to GetKeyLogWriter() (SSLKEYLOGFILE env var).
 	KeyLogWriter io.Writer
 
-	// DisableSpeculativeTLS disables the speculative TLS optimization for proxy connections.
-	// When false (default), CONNECT request and TLS ClientHello are sent together,
-	// saving one round-trip. Set to true if you experience issues with certain proxies.
-	DisableSpeculativeTLS bool
+	// EnableSpeculativeTLS enables the speculative TLS optimization for proxy connections.
+	// When true, CONNECT request and TLS ClientHello are sent together, saving one
+	// round-trip. Disabled by default due to compatibility issues with some proxies.
+	EnableSpeculativeTLS bool
+
+	// CustomJA3 is a JA3 fingerprint string to use instead of the preset's TLS fingerprint.
+	// Format: TLSVersion,CipherSuites,Extensions,EllipticCurves,PointFormats
+	// When set, the preset's ClientHelloID is overridden with HelloCustom.
+	// Not applied to H3 (QUIC TLS uses different extensions).
+	CustomJA3 string
+
+	// CustomJA3Extras provides extension data that JA3 cannot capture (e.g., signature
+	// algorithms, ALPN). If nil, sensible Chrome-like defaults are used.
+	CustomJA3Extras *fingerprint.JA3Extras
+
+	// CustomH2Settings overrides the preset's HTTP/2 settings (from Akamai fingerprint).
+	CustomH2Settings *fingerprint.HTTP2Settings
+
+	// CustomPseudoOrder overrides the pseudo-header order (from Akamai fingerprint).
+	// Values: [":method", ":authority", ":scheme", ":path"]
+	CustomPseudoOrder []string
+
+	// CustomTCPFingerprint overrides individual TCP/IP fingerprint fields from the preset.
+	// Only non-zero fields are applied; zero fields keep the preset default.
+	CustomTCPFingerprint *fingerprint.TCPFingerprint
 }
 
 // Request represents an HTTP request
@@ -274,6 +295,9 @@ type Transport struct {
 	customHeaderOrder   []string
 	customHeaderOrderMu sync.RWMutex
 
+	// Custom pseudo-header order (nil = use preset's browser-type heuristic)
+	customPseudoOrder []string
+
 	// TLS-only mode: skip preset HTTP headers, use TLS fingerprint only
 	tlsOnly bool
 }
@@ -297,17 +321,48 @@ func NewTransportWithConfig(presetName string, proxy *ProxyConfig, config *Trans
 	tlsOnly := false
 	if config != nil {
 		tlsOnly = config.TLSOnly
+
+		// Override preset HTTP/2 settings with custom Akamai fingerprint
+		if config.CustomH2Settings != nil {
+			preset.HTTP2Settings = *config.CustomH2Settings
+		}
+		// Override individual TCP/IP fingerprint fields
+		if config.CustomTCPFingerprint != nil {
+			fp := config.CustomTCPFingerprint
+			if fp.TTL > 0 {
+				preset.TCPFingerprint.TTL = fp.TTL
+			}
+			if fp.MSS > 0 {
+				preset.TCPFingerprint.MSS = fp.MSS
+			}
+			if fp.WindowSize > 0 {
+				preset.TCPFingerprint.WindowSize = fp.WindowSize
+			}
+			if fp.WindowScale > 0 {
+				preset.TCPFingerprint.WindowScale = fp.WindowScale
+			}
+			if fp.DFBit {
+				preset.TCPFingerprint.DFBit = fp.DFBit
+			}
+		}
+	}
+
+	// Capture custom pseudo-header order from config
+	var customPseudoOrder []string
+	if config != nil && len(config.CustomPseudoOrder) > 0 {
+		customPseudoOrder = config.CustomPseudoOrder
 	}
 
 	t := &Transport{
-		dnsCache:        dnsCache,
-		preset:          preset,
-		timeout:         30 * time.Second,
-		protocol:        ProtocolAuto,
-		protocolSupport: make(map[string]Protocol),
-		proxy:           proxy,
-		config:          config,
-		tlsOnly:         tlsOnly,
+		dnsCache:          dnsCache,
+		preset:            preset,
+		timeout:           30 * time.Second,
+		protocol:          ProtocolAuto,
+		protocolSupport:   make(map[string]Protocol),
+		proxy:             proxy,
+		config:            config,
+		customPseudoOrder: customPseudoOrder,
+		tlsOnly:           tlsOnly,
 	}
 
 	// Determine effective TCP and UDP proxy URLs
@@ -409,9 +464,14 @@ func (t *Transport) SetProxy(proxy *ProxyConfig) {
 	t.h2Transport.Close()
 	t.h3Transport.Close()
 
-	// Recreate HTTP/1.1 and HTTP/2 with new proxy config
-	t.h1Transport = NewHTTP1TransportWithProxy(t.preset, t.dnsCache, proxy)
-	t.h2Transport = NewHTTP2TransportWithProxy(t.preset, t.dnsCache, proxy)
+	// Recreate HTTP/1.1 and HTTP/2 with new proxy config, preserving transport config
+	// (custom JA3, H2 settings, speculative TLS, etc.)
+	tcpProxy := proxy
+	if proxy != nil && proxy.TCPProxy != "" {
+		tcpProxy = &ProxyConfig{URL: proxy.TCPProxy}
+	}
+	t.h1Transport = NewHTTP1TransportWithConfig(t.preset, t.dnsCache, tcpProxy, t.config)
+	t.h2Transport = NewHTTP2TransportWithConfig(t.preset, t.dnsCache, tcpProxy, t.config)
 
 	// Recreate HTTP/3 - with proxy support if applicable
 	// Check both URL (unified proxy) and UDPProxy (split proxy config)
@@ -451,20 +511,42 @@ func (t *Transport) SetProxy(proxy *ProxyConfig) {
 	} else {
 		t.h3Transport, _ = NewHTTP3Transport(t.preset, t.dnsCache)
 	}
+
+	// Re-apply insecureSkipVerify to recreated transports
+	if t.insecureSkipVerify {
+		t.h1Transport.SetInsecureSkipVerify(true)
+		t.h2Transport.SetInsecureSkipVerify(true)
+		if t.h3Transport != nil {
+			t.h3Transport.SetInsecureSkipVerify(true)
+		}
+	}
 }
 
 // SetPreset changes the fingerprint preset
 func (t *Transport) SetPreset(presetName string) {
 	t.preset = fingerprint.Get(presetName)
 
+	// Re-apply custom H2 settings to the fresh preset (if any)
+	if t.config != nil && t.config.CustomH2Settings != nil {
+		t.preset.HTTP2Settings = *t.config.CustomH2Settings
+	}
+
 	// Close all transports
 	t.h1Transport.Close()
 	t.h2Transport.Close()
 	t.h3Transport.Close()
 
-	// Recreate HTTP/1.1 and HTTP/2 with new preset
-	t.h1Transport = NewHTTP1TransportWithProxy(t.preset, t.dnsCache, t.proxy)
-	t.h2Transport = NewHTTP2TransportWithProxy(t.preset, t.dnsCache, t.proxy)
+	// Recreate HTTP/1.1 and HTTP/2 with new preset, preserving transport config
+	var tcpProxy *ProxyConfig
+	if t.proxy != nil {
+		if t.proxy.TCPProxy != "" {
+			tcpProxy = &ProxyConfig{URL: t.proxy.TCPProxy}
+		} else {
+			tcpProxy = t.proxy
+		}
+	}
+	t.h1Transport = NewHTTP1TransportWithConfig(t.preset, t.dnsCache, tcpProxy, t.config)
+	t.h2Transport = NewHTTP2TransportWithConfig(t.preset, t.dnsCache, tcpProxy, t.config)
 
 	// Recreate HTTP/3 - with proxy support if applicable
 	if t.proxy != nil && t.proxy.URL != "" {
@@ -487,6 +569,15 @@ func (t *Transport) SetPreset(presetName string) {
 		}
 	} else {
 		t.h3Transport, _ = NewHTTP3Transport(t.preset, t.dnsCache)
+	}
+
+	// Re-apply insecureSkipVerify to recreated transports
+	if t.insecureSkipVerify {
+		t.h1Transport.SetInsecureSkipVerify(true)
+		t.h2Transport.SetInsecureSkipVerify(true)
+		if t.h3Transport != nil {
+			t.h3Transport.SetInsecureSkipVerify(true)
+		}
 	}
 }
 
@@ -653,6 +744,11 @@ func (t *Transport) getHeaderOrder() []string {
 	return t.customHeaderOrder
 }
 
+// getCustomPseudoOrder returns the custom pseudo-header order (from Akamai fingerprint).
+func (t *Transport) getCustomPseudoOrder() []string {
+	return t.customPseudoOrder
+}
+
 // GetConnectHost returns the connection host for a request host.
 // If there's a ConnectTo mapping, returns the mapped host.
 // Otherwise returns the original host.
@@ -742,6 +838,11 @@ func (t *Transport) Do(ctx context.Context, req *Request) (*Response, error) {
 				if err == nil {
 					return resp, nil
 				}
+				// Reuse TLS conn if proxy negotiated h1.1 instead of h2 (e.g. Charles, mitmproxy)
+				var alpnErr *ALPNMismatchError
+				if errors.As(err, &alpnErr) {
+					return t.doHTTP1WithTLSConn(ctx, req, alpnErr)
+				}
 				return t.doHTTP1(ctx, req)
 			}
 
@@ -756,12 +857,22 @@ func (t *Transport) Do(ctx context.Context, req *Request) (*Response, error) {
 				if err == nil {
 					return resp, nil
 				}
+				// Reuse TLS conn if proxy negotiated h1.1 instead of h2
+				var alpnErr *ALPNMismatchError
+				if errors.As(err, &alpnErr) {
+					return t.doHTTP1WithTLSConn(ctx, req, alpnErr)
+				}
 				return t.doHTTP1(ctx, req)
 			}
 			// HTTP proxy - only supports H2/H1
 			resp, err := t.doHTTP2(ctx, req)
 			if err == nil {
 				return resp, nil
+			}
+			// Reuse TLS conn if proxy negotiated h1.1 instead of h2 (e.g. Charles, mitmproxy)
+			var alpnErr *ALPNMismatchError
+			if errors.As(err, &alpnErr) {
+				return t.doHTTP1WithTLSConn(ctx, req, alpnErr)
 			}
 			return t.doHTTP1(ctx, req)
 
@@ -1071,6 +1182,8 @@ func (t *Transport) doHTTP1(ctx context.Context, req *Request) (*Response, error
 		bodyReader = req.BodyReader
 	} else if len(req.Body) > 0 {
 		bodyReader = bytes.NewReader(req.Body)
+	} else if method == "POST" || method == "PUT" || method == "PATCH" {
+		bodyReader = bytes.NewReader([]byte{})
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
@@ -1086,7 +1199,7 @@ func (t *Transport) doHTTP1(ctx context.Context, req *Request) (*Response, error
 
 	// Set preset headers (with ordering for fingerprinting)
 	// Pass "h1" protocol so Chrome presets don't send Priority header on HTTP/1.1
-	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), effectiveTLSOnly, "h1")
+	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.getCustomPseudoOrder(), effectiveTLSOnly, "h1", req.Headers)
 
 	// Override with custom headers (multi-value support)
 	// Use Set for first value to replace preset headers, Add for additional values
@@ -1183,6 +1296,8 @@ func (t *Transport) doHTTP1WithTLSConn(ctx context.Context, req *Request, alpnEr
 		bodyReader = req.BodyReader
 	} else if len(req.Body) > 0 {
 		bodyReader = bytes.NewReader(req.Body)
+	} else if method == "POST" || method == "PUT" || method == "PATCH" {
+		bodyReader = bytes.NewReader([]byte{})
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
@@ -1198,7 +1313,7 @@ func (t *Transport) doHTTP1WithTLSConn(ctx context.Context, req *Request, alpnEr
 	}
 
 	// Set preset headers - pass "h1" protocol so Chrome presets don't send Priority header
-	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), effectiveTLSOnly, "h1")
+	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.getCustomPseudoOrder(), effectiveTLSOnly, "h1", req.Headers)
 
 	// Override with custom headers (multi-value support)
 	// Use Set for first value to replace preset headers, Add for additional values
@@ -1303,6 +1418,8 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 		bodyReader = req.BodyReader
 	} else if len(req.Body) > 0 {
 		bodyReader = bytes.NewReader(req.Body)
+	} else if method == "POST" || method == "PUT" || method == "PATCH" {
+		bodyReader = bytes.NewReader([]byte{})
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
@@ -1317,7 +1434,7 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 	}
 
 	// Set preset headers (with ordering for fingerprinting)
-	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), effectiveTLSOnly, "h2")
+	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.getCustomPseudoOrder(), effectiveTLSOnly, "h2", req.Headers)
 
 	// Override with custom headers (multi-value support)
 	// Use Set for first value to replace preset headers, Add for additional values
@@ -1437,6 +1554,8 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 		bodyReader = req.BodyReader
 	} else if len(req.Body) > 0 {
 		bodyReader = bytes.NewReader(req.Body)
+	} else if method == "POST" || method == "PUT" || method == "PATCH" {
+		bodyReader = bytes.NewReader([]byte{})
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
@@ -1451,7 +1570,7 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 	}
 
 	// Set preset headers (with ordering for fingerprinting)
-	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), effectiveTLSOnly, "h3")
+	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.getCustomPseudoOrder(), effectiveTLSOnly, "h3", req.Headers)
 
 	// Override with custom headers (multi-value support)
 	// Use Set for first value to replace preset headers, Add for additional values
@@ -1593,6 +1712,11 @@ func (t *Transport) GetHTTP3Transport() *HTTP3Transport {
 	return t.h3Transport
 }
 
+// GetConfig returns the transport's configuration.
+func (t *Transport) GetConfig() *TransportConfig {
+	return t.config
+}
+
 // SetSessionIdentifier sets a session identifier on all TLS session caches.
 // This is used to isolate TLS sessions when the same host is accessed through
 // different proxies or with different session configurations.
@@ -1626,9 +1750,11 @@ func (t *Transport) SetSessionIdentifier(sessionId string) {
 // applyPresetHeaders applies headers from the preset to the request.
 // Uses ordered headers (HeaderOrder) if available, otherwise falls back to the map.
 // customHeaderOrder overrides preset's default order if provided.
+// customPseudoOrder overrides the preset's pseudo-header order if provided.
 // If tlsOnly is true, skips applying preset headers but still sets header order for fingerprinting.
 // The protocol parameter ("h1", "h2", "h3") is used for protocol-specific header handling.
-func applyPresetHeaders(httpReq *http.Request, preset *fingerprint.Preset, customHeaderOrder []string, tlsOnly bool, protocol string) {
+// userHeaders are the user-provided request headers, used for auto-detecting CORS mode.
+func applyPresetHeaders(httpReq *http.Request, preset *fingerprint.Preset, customHeaderOrder []string, customPseudoOrder []string, tlsOnly bool, protocol string, userHeaders map[string][]string) {
 	// In TLS-only mode, skip applying preset headers but still set header order
 	if !tlsOnly {
 		if len(preset.HeaderOrder) > 0 {
@@ -1644,6 +1770,28 @@ func applyPresetHeaders(httpReq *http.Request, preset *fingerprint.Preset, custo
 		}
 		httpReq.Header.Set("User-Agent", preset.UserAgent)
 
+		// Auto-detect CORS mode from user's Accept header.
+		// If the user sends an API-style Accept (application/json, */*, etc.),
+		// adjust sec-fetch headers to CORS mode instead of Navigate.
+		// This prevents sending browser navigation headers to API endpoints,
+		// which WAFs like Incapsula flag as bot behavior.
+		if isAPIRequest(userHeaders) {
+			httpReq.Header.Set("Sec-Fetch-Mode", "cors")
+			httpReq.Header.Set("Sec-Fetch-Dest", "empty")
+			httpReq.Header.Set("Sec-Fetch-Site", "cross-site")
+			httpReq.Header.Del("Sec-Fetch-User")
+			httpReq.Header.Del("sec-fetch-user")
+			httpReq.Header.Del("Upgrade-Insecure-Requests")
+			httpReq.Header.Del("upgrade-insecure-requests")
+			// CORS uses u=1,i priority (lower urgency than navigation's u=0,i)
+			if httpReq.Header.Get("Priority") != "" {
+				httpReq.Header.Set("Priority", "u=1, i")
+			}
+			if httpReq.Header.Get("priority") != "" {
+				httpReq.Header.Set("priority", "u=1, i")
+			}
+		}
+
 		// Chrome does NOT send Priority header on HTTP/1.1, only on HTTP/2 and HTTP/3.
 		// Some anti-bots (Cloudflare, Datadome, Akamai) check for this and flag requests
 		// that send Priority on H1 as bots.
@@ -1658,12 +1806,10 @@ func applyPresetHeaders(httpReq *http.Request, preset *fingerprint.Preset, custo
 	}
 
 	// Set header order for HTTP/2 and HTTP/3 fingerprinting
-	// Custom order takes precedence, then preset's order, then fallback to hardcoded default
+	// Chrome uses the same header order for both H2 and H3 (same request_->extra_headers vector)
 	if len(customHeaderOrder) > 0 {
-		// Use custom header order
 		httpReq.Header[http.HeaderOrderKey] = customHeaderOrder
 	} else if len(preset.HeaderOrder) > 0 {
-		// Use preset's header order
 		order := make([]string, len(preset.HeaderOrder))
 		for i, hp := range preset.HeaderOrder {
 			order[i] = hp.Key
@@ -1680,13 +1826,36 @@ func applyPresetHeaders(httpReq *http.Request, preset *fingerprint.Preset, custo
 		}
 	}
 
-	// Set pseudo-header order based on browser type
-	// Safari/iOS uses m,s,p,a; Chrome uses m,a,s,p
-	if preset.HTTP2Settings.NoRFC7540Priorities {
+	// Set pseudo-header order: custom (Akamai) > browser-type heuristic
+	if len(customPseudoOrder) > 0 {
+		httpReq.Header[http.PHeaderOrderKey] = customPseudoOrder
+	} else if preset.HTTP2Settings.NoRFC7540Priorities {
+		// Safari/iOS uses m,s,p,a
 		httpReq.Header[http.PHeaderOrderKey] = []string{":method", ":scheme", ":path", ":authority"}
 	} else {
+		// Chrome uses m,a,s,p
 		httpReq.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
 	}
+}
+
+// isAPIRequest detects if user headers indicate an API call (not browser navigation).
+// Checks Accept header for API content types like application/json, */*, etc.
+func isAPIRequest(userHeaders map[string][]string) bool {
+	if userHeaders == nil {
+		return false
+	}
+	// Case-insensitive lookup for Accept header
+	for k, v := range userHeaders {
+		if strings.EqualFold(k, "Accept") && len(v) > 0 {
+			lower := strings.ToLower(v[0])
+			return strings.Contains(lower, "application/json") ||
+				strings.Contains(lower, "application/xml") ||
+				strings.Contains(lower, "text/plain") ||
+				strings.Contains(lower, "application/octet-stream") ||
+				lower == "*/*"
+		}
+	}
+	return false
 }
 
 // isChromePreset returns true if the preset name indicates a Chrome fingerprint.

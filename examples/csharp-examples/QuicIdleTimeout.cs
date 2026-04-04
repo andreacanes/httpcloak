@@ -46,7 +46,7 @@ class QuicIdleTimeoutExamples
         Console.WriteLine(new string('-', 50));
 
         using var session = new Session(
-            preset: Presets.Chrome143,
+            preset: Presets.Chrome145,
             httpVersion: "h3"  // Force HTTP/3 to use QUIC
         );
 
@@ -66,7 +66,7 @@ class QuicIdleTimeoutExamples
         Console.WriteLine(new string('-', 50));
 
         using var session = new Session(
-            preset: Presets.Chrome143,
+            preset: Presets.Chrome145,
             httpVersion: "h3",
             quicIdleTimeout: 120  // 2 minutes
         );
@@ -95,7 +95,7 @@ class QuicIdleTimeoutExamples
         Console.WriteLine(new string('-', 50));
 
         using var session = new Session(
-            preset: Presets.Chrome143,
+            preset: Presets.Chrome145,
             httpVersion: "h3",
             quicIdleTimeout: 300  // 5 minutes
         );
@@ -116,7 +116,7 @@ class QuicIdleTimeoutExamples
         Console.WriteLine(new string('-', 50));
 
         using var session = new Session(
-            preset: Presets.Chrome143,
+            preset: Presets.Chrome145,
             httpVersion: "h3",
             quicIdleTimeout: 180,  // 3 minutes
             timeout: 60,          // Request timeout

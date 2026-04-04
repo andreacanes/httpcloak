@@ -60,9 +60,49 @@ type Preset struct {
 	QUICPSKClientHelloID tls.ClientHelloID // For QUIC/HTTP/3 with PSK (session resumption)
 	UserAgent         string
 	Headers           map[string]string // For backward compatibility
-	HeaderOrder       []HeaderPair      // Ordered headers for HTTP/2 and HTTP/3
+	HeaderOrder       []HeaderPair      // Ordered headers for HTTP/2
 	HTTP2Settings     HTTP2Settings
+	TCPFingerprint    TCPFingerprint
 	SupportHTTP3      bool
+}
+
+// TCPFingerprint contains TCP/IP stack parameters that identify the OS.
+// Anti-bot systems check TTL, window size, and other TCP options in the SYN packet
+// to verify the claimed browser platform matches the actual OS.
+type TCPFingerprint struct {
+	TTL         int  // IP Time-To-Live: 128=Windows, 64=Linux/macOS/iOS/Android
+	MSS         int  // TCP Maximum Segment Size: 1460 for standard Ethernet
+	WindowSize  int  // TCP Window Size in SYN: 64240=Win10/11, 65535=Linux/macOS
+	WindowScale int  // TCP Window Scale option: 8=Win10/11, 7=Linux/Android, 6=macOS/iOS
+	DFBit       bool // IP Don't Fragment flag
+}
+
+// WindowsTCPFingerprint returns TCP fingerprint values for Windows 10/11
+func WindowsTCPFingerprint() TCPFingerprint {
+	return TCPFingerprint{TTL: 128, MSS: 1460, WindowSize: 64240, WindowScale: 8, DFBit: true}
+}
+
+// LinuxTCPFingerprint returns TCP fingerprint values for Linux
+func LinuxTCPFingerprint() TCPFingerprint {
+	return TCPFingerprint{TTL: 64, MSS: 1460, WindowSize: 65535, WindowScale: 7, DFBit: true}
+}
+
+// MacOSTCPFingerprint returns TCP fingerprint values for macOS
+func MacOSTCPFingerprint() TCPFingerprint {
+	return TCPFingerprint{TTL: 64, MSS: 1460, WindowSize: 65535, WindowScale: 6, DFBit: true}
+}
+
+// PlatformTCPFingerprint returns the TCP fingerprint matching the given platform string.
+// Used by auto-platform presets that detect the running OS at runtime.
+func PlatformTCPFingerprint(platform string) TCPFingerprint {
+	switch platform {
+	case "Windows":
+		return WindowsTCPFingerprint()
+	case "macOS":
+		return MacOSTCPFingerprint()
+	default:
+		return LinuxTCPFingerprint()
+	}
 }
 
 // HTTP2Settings contains HTTP/2 connection settings
@@ -126,17 +166,18 @@ func Chrome133() *Preset {
 			EnablePush:             false,
 			MaxConcurrentStreams:   0,
 			InitialWindowSize:      6291456,
-			MaxFrameSize:           16384,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
 			MaxHeaderListSize:      262144,
 			ConnectionWindowUpdate: 15663105,
 			StreamWeight:           256,
 			StreamExclusive:        true,
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: false, // Legacy preset, no proper QUIC fingerprint
 	}
 }
 
-// Chrome141 returns the Chrome 141 fingerprint preset (latest)
+// Chrome141 returns the Chrome 141 fingerprint preset
 func Chrome141() *Preset {
 	p := GetPlatformInfo()
 	return &Preset{
@@ -181,12 +222,13 @@ func Chrome141() *Preset {
 			EnablePush:             false,
 			MaxConcurrentStreams:   0,
 			InitialWindowSize:      6291456,
-			MaxFrameSize:           16384,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
 			MaxHeaderListSize:      262144,
 			ConnectionWindowUpdate: 15663105,
 			StreamWeight:           256,
 			StreamExclusive:        true,
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: false, // Legacy preset, no proper QUIC fingerprint
 	}
 }
@@ -229,6 +271,7 @@ func Firefox133() *Preset {
 			StreamWeight:           42,
 			StreamExclusive:        false,
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: false, // No Firefox QUIC fingerprint in utls
 	}
 }
@@ -295,12 +338,13 @@ func Chrome143() *Preset {
 			EnablePush:             false,
 			MaxConcurrentStreams:   0,
 			InitialWindowSize:      6291456,
-			MaxFrameSize:           16384,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
 			MaxHeaderListSize:      262144,
 			ConnectionWindowUpdate: 15663105,
 			StreamWeight:           256,
 			StreamExclusive:        true,
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -352,12 +396,13 @@ func Chrome143Windows() *Preset {
 			EnablePush:             false,
 			MaxConcurrentStreams:   0,
 			InitialWindowSize:      6291456,
-			MaxFrameSize:           16384,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
 			MaxHeaderListSize:      262144,
 			ConnectionWindowUpdate: 15663105,
 			StreamWeight:           256,
 			StreamExclusive:        true,
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -409,12 +454,13 @@ func Chrome143Linux() *Preset {
 			EnablePush:             false,
 			MaxConcurrentStreams:   0,
 			InitialWindowSize:      6291456,
-			MaxFrameSize:           16384,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
 			MaxHeaderListSize:      262144,
 			ConnectionWindowUpdate: 15663105,
 			StreamWeight:           256,
 			StreamExclusive:        true,
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -466,12 +512,13 @@ func Chrome143macOS() *Preset {
 			EnablePush:             false,
 			MaxConcurrentStreams:   0,
 			InitialWindowSize:      6291456,
-			MaxFrameSize:           16384,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
 			MaxHeaderListSize:      262144,
 			ConnectionWindowUpdate: 15663105,
 			StreamWeight:           256,
 			StreamExclusive:        true,
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -533,12 +580,13 @@ func Chrome144() *Preset {
 			EnablePush:             false,
 			MaxConcurrentStreams:   0,
 			InitialWindowSize:      6291456,
-			MaxFrameSize:           16384,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
 			MaxHeaderListSize:      262144,
 			ConnectionWindowUpdate: 15663105,
 			StreamWeight:           256,
 			StreamExclusive:        true,
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -586,12 +634,13 @@ func Chrome144Windows() *Preset {
 			EnablePush:             false,
 			MaxConcurrentStreams:   0,
 			InitialWindowSize:      6291456,
-			MaxFrameSize:           16384,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
 			MaxHeaderListSize:      262144,
 			ConnectionWindowUpdate: 15663105,
 			StreamWeight:           256,
 			StreamExclusive:        true,
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -639,12 +688,13 @@ func Chrome144Linux() *Preset {
 			EnablePush:             false,
 			MaxConcurrentStreams:   0,
 			InitialWindowSize:      6291456,
-			MaxFrameSize:           16384,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
 			MaxHeaderListSize:      262144,
 			ConnectionWindowUpdate: 15663105,
 			StreamWeight:           256,
 			StreamExclusive:        true,
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -692,12 +742,473 @@ func Chrome144macOS() *Preset {
 			EnablePush:             false,
 			MaxConcurrentStreams:   0,
 			InitialWindowSize:      6291456,
-			MaxFrameSize:           16384,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
 			MaxHeaderListSize:      262144,
 			ConnectionWindowUpdate: 15663105,
 			StreamWeight:           256,
 			StreamExclusive:        true,
 		},
+		TCPFingerprint: TCPFingerprint{},
+		SupportHTTP3: true,
+	}
+}
+
+// Chrome145 returns the Chrome 145 fingerprint preset with platform-specific TLS fingerprint
+func Chrome145() *Preset {
+	p := GetPlatformInfo()
+	// Chrome 145 uses same TLS fingerprint as Chrome 144/143
+	var clientHelloID, pskClientHelloID tls.ClientHelloID
+	switch p.Platform {
+	case "Windows":
+		clientHelloID = tls.HelloChrome_145_Windows
+		pskClientHelloID = tls.HelloChrome_145_Windows_PSK
+	case "macOS":
+		clientHelloID = tls.HelloChrome_145_macOS
+		pskClientHelloID = tls.HelloChrome_145_macOS_PSK
+	default: // Linux and others
+		clientHelloID = tls.HelloChrome_145_Linux
+		pskClientHelloID = tls.HelloChrome_145_Linux_PSK
+	}
+	return &Preset{
+		Name:                 "chrome-145",
+		ClientHelloID:        clientHelloID,
+		PSKClientHelloID:     pskClientHelloID,
+		QUICClientHelloID:    tls.HelloChrome_145_QUIC,
+		QUICPSKClientHelloID: tls.HelloChrome_145_QUIC_PSK,
+		UserAgent:            "Mozilla/5.0 " + p.UserAgentOS + " AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+		Headers: map[string]string{
+			"sec-ch-ua":                 `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`,
+			"sec-ch-ua-mobile":          "?0",
+			"sec-ch-ua-platform":        `"` + p.Platform + `"`,
+			"Upgrade-Insecure-Requests": "1",
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-User":            "?1",
+			"Sec-Fetch-Dest":            "document",
+			"Accept-Encoding":           "gzip, deflate, br, zstd",
+			"Accept-Language":           "en-US,en;q=0.9",
+			"Priority":                  "u=0, i",
+		},
+		HeaderOrder: []HeaderPair{
+			{"sec-ch-ua", `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`},
+			{"sec-ch-ua-mobile", "?0"},
+			{"sec-ch-ua-platform", `"` + p.Platform + `"`},
+			{"upgrade-insecure-requests", "1"},
+			{"user-agent", ""},
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-mode", "navigate"},
+			{"sec-fetch-user", "?1"},
+			{"sec-fetch-dest", "document"},
+			{"accept-encoding", "gzip, deflate, br, zstd"},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"priority", "u=0, i"},
+		},
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        65536,
+			EnablePush:             false,
+			MaxConcurrentStreams:   0,
+			InitialWindowSize:      6291456,
+			MaxFrameSize:           0, // Chrome doesn't send setting 5 (16384 is RFC default)
+			MaxHeaderListSize:      262144,
+			ConnectionWindowUpdate: 15663105,
+			StreamWeight:           256,
+			StreamExclusive:        true,
+		},
+		TCPFingerprint: TCPFingerprint{},
+		SupportHTTP3: true,
+	}
+}
+
+// Chrome145Windows returns Chrome 145 with Windows platform
+func Chrome145Windows() *Preset {
+	return &Preset{
+		Name:                 "chrome-145-windows",
+		ClientHelloID:        tls.HelloChrome_145_Windows,
+		PSKClientHelloID:     tls.HelloChrome_145_Windows_PSK,
+		QUICClientHelloID:    tls.HelloChrome_145_QUIC,
+		QUICPSKClientHelloID: tls.HelloChrome_145_QUIC_PSK,
+		UserAgent:            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+		Headers: map[string]string{
+			"sec-ch-ua":                 `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`,
+			"sec-ch-ua-mobile":          "?0",
+			"sec-ch-ua-platform":        `"Windows"`,
+			"Upgrade-Insecure-Requests": "1",
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-User":            "?1",
+			"Sec-Fetch-Dest":            "document",
+			"Accept-Encoding":           "gzip, deflate, br, zstd",
+			"Accept-Language":           "en-US,en;q=0.9",
+			"Priority":                  "u=0, i",
+		},
+		HeaderOrder: []HeaderPair{
+			{"sec-ch-ua", `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`},
+			{"sec-ch-ua-mobile", "?0"},
+			{"sec-ch-ua-platform", `"Windows"`},
+			{"upgrade-insecure-requests", "1"},
+			{"user-agent", ""},
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-mode", "navigate"},
+			{"sec-fetch-user", "?1"},
+			{"sec-fetch-dest", "document"},
+			{"accept-encoding", "gzip, deflate, br, zstd"},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"priority", "u=0, i"},
+		},
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        65536,
+			EnablePush:             false,
+			MaxConcurrentStreams:   0,
+			InitialWindowSize:      6291456,
+			MaxFrameSize:           0, // Chrome doesn't send setting 5 (16384 is RFC default)
+			MaxHeaderListSize:      262144,
+			ConnectionWindowUpdate: 15663105,
+			StreamWeight:           256,
+			StreamExclusive:        true,
+		},
+		TCPFingerprint: TCPFingerprint{},
+		SupportHTTP3: true,
+	}
+}
+
+// Chrome145Linux returns Chrome 145 with Linux platform
+func Chrome145Linux() *Preset {
+	return &Preset{
+		Name:                 "chrome-145-linux",
+		ClientHelloID:        tls.HelloChrome_145_Linux,
+		PSKClientHelloID:     tls.HelloChrome_145_Linux_PSK,
+		QUICClientHelloID:    tls.HelloChrome_145_QUIC,
+		QUICPSKClientHelloID: tls.HelloChrome_145_QUIC_PSK,
+		UserAgent:            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+		Headers: map[string]string{
+			"sec-ch-ua":                 `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`,
+			"sec-ch-ua-mobile":          "?0",
+			"sec-ch-ua-platform":        `"Linux"`,
+			"Upgrade-Insecure-Requests": "1",
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-User":            "?1",
+			"Sec-Fetch-Dest":            "document",
+			"Accept-Encoding":           "gzip, deflate, br, zstd",
+			"Accept-Language":           "en-US,en;q=0.9",
+			"Priority":                  "u=0, i",
+		},
+		HeaderOrder: []HeaderPair{
+			{"sec-ch-ua", `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`},
+			{"sec-ch-ua-mobile", "?0"},
+			{"sec-ch-ua-platform", `"Linux"`},
+			{"upgrade-insecure-requests", "1"},
+			{"user-agent", ""},
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-mode", "navigate"},
+			{"sec-fetch-user", "?1"},
+			{"sec-fetch-dest", "document"},
+			{"accept-encoding", "gzip, deflate, br, zstd"},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"priority", "u=0, i"},
+		},
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        65536,
+			EnablePush:             false,
+			MaxConcurrentStreams:   0,
+			InitialWindowSize:      6291456,
+			MaxFrameSize:           0,
+			MaxHeaderListSize:      262144,
+			ConnectionWindowUpdate: 15663105,
+			StreamWeight:           256,
+			StreamExclusive:        true,
+		},
+		TCPFingerprint: TCPFingerprint{},
+		SupportHTTP3: true,
+	}
+}
+
+// Chrome145macOS returns Chrome 145 with macOS platform
+func Chrome145macOS() *Preset {
+	return &Preset{
+		Name:                 "chrome-145-macos",
+		ClientHelloID:        tls.HelloChrome_145_macOS,
+		PSKClientHelloID:     tls.HelloChrome_145_macOS_PSK,
+		QUICClientHelloID:    tls.HelloChrome_145_QUIC,
+		QUICPSKClientHelloID: tls.HelloChrome_145_QUIC_PSK,
+		UserAgent:            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+		Headers: map[string]string{
+			"sec-ch-ua":                 `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`,
+			"sec-ch-ua-mobile":          "?0",
+			"sec-ch-ua-platform":        `"macOS"`,
+			"Upgrade-Insecure-Requests": "1",
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-User":            "?1",
+			"Sec-Fetch-Dest":            "document",
+			"Accept-Encoding":           "gzip, deflate, br, zstd",
+			"Accept-Language":           "en-US,en;q=0.9",
+			"Priority":                  "u=0, i",
+		},
+		HeaderOrder: []HeaderPair{
+			{"sec-ch-ua", `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`},
+			{"sec-ch-ua-mobile", "?0"},
+			{"sec-ch-ua-platform", `"macOS"`},
+			{"upgrade-insecure-requests", "1"},
+			{"user-agent", ""},
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-mode", "navigate"},
+			{"sec-fetch-user", "?1"},
+			{"sec-fetch-dest", "document"},
+			{"accept-encoding", "gzip, deflate, br, zstd"},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"priority", "u=0, i"},
+		},
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        65536,
+			EnablePush:             false,
+			MaxConcurrentStreams:   0,
+			InitialWindowSize:      6291456,
+			MaxFrameSize:           0,
+			MaxHeaderListSize:      262144,
+			ConnectionWindowUpdate: 15663105,
+			StreamWeight:           256,
+			StreamExclusive:        true,
+		},
+		TCPFingerprint: TCPFingerprint{},
+		SupportHTTP3: true,
+	}
+}
+
+// Chrome146 returns the Chrome 146 fingerprint preset with platform-specific TLS fingerprint
+func Chrome146() *Preset {
+	p := GetPlatformInfo()
+	// Chrome 146 uses same TLS fingerprint as Chrome 145/144/143
+	var clientHelloID, pskClientHelloID tls.ClientHelloID
+	switch p.Platform {
+	case "Windows":
+		clientHelloID = tls.HelloChrome_146_Windows
+		pskClientHelloID = tls.HelloChrome_146_Windows_PSK
+	case "macOS":
+		clientHelloID = tls.HelloChrome_146_macOS
+		pskClientHelloID = tls.HelloChrome_146_macOS_PSK
+	default: // Linux and others
+		clientHelloID = tls.HelloChrome_146_Linux
+		pskClientHelloID = tls.HelloChrome_146_Linux_PSK
+	}
+	return &Preset{
+		Name:                 "chrome-146",
+		ClientHelloID:        clientHelloID,
+		PSKClientHelloID:     pskClientHelloID,
+		QUICClientHelloID:    tls.HelloChrome_146_QUIC,
+		QUICPSKClientHelloID: tls.HelloChrome_146_QUIC_PSK,
+		UserAgent:            "Mozilla/5.0 " + p.UserAgentOS + " AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+		Headers: map[string]string{
+			"sec-ch-ua":                 `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`,
+			"sec-ch-ua-mobile":          "?0",
+			"sec-ch-ua-platform":        `"` + p.Platform + `"`,
+			"Upgrade-Insecure-Requests": "1",
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-User":            "?1",
+			"Sec-Fetch-Dest":            "document",
+			"Accept-Encoding":           "gzip, deflate, br, zstd",
+			"Accept-Language":           "en-US,en;q=0.9",
+			"Priority":                  "u=0, i",
+		},
+		HeaderOrder: []HeaderPair{
+			{"sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`},
+			{"sec-ch-ua-mobile", "?0"},
+			{"sec-ch-ua-platform", `"` + p.Platform + `"`},
+			{"upgrade-insecure-requests", "1"},
+			{"user-agent", ""},
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-mode", "navigate"},
+			{"sec-fetch-user", "?1"},
+			{"sec-fetch-dest", "document"},
+			{"accept-encoding", "gzip, deflate, br, zstd"},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"priority", "u=0, i"},
+		},
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        65536,
+			EnablePush:             false,
+			MaxConcurrentStreams:   0,
+			InitialWindowSize:      6291456,
+			MaxFrameSize:           0,
+			MaxHeaderListSize:      262144,
+			ConnectionWindowUpdate: 15663105,
+			StreamWeight:           256,
+			StreamExclusive:        true,
+		},
+		TCPFingerprint: TCPFingerprint{},
+		SupportHTTP3: true,
+	}
+}
+
+// Chrome146Windows returns Chrome 146 with Windows platform
+func Chrome146Windows() *Preset {
+	return &Preset{
+		Name:                 "chrome-146-windows",
+		ClientHelloID:        tls.HelloChrome_146_Windows,
+		PSKClientHelloID:     tls.HelloChrome_146_Windows_PSK,
+		QUICClientHelloID:    tls.HelloChrome_146_QUIC,
+		QUICPSKClientHelloID: tls.HelloChrome_146_QUIC_PSK,
+		UserAgent:            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+		Headers: map[string]string{
+			"sec-ch-ua":                 `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`,
+			"sec-ch-ua-mobile":          "?0",
+			"sec-ch-ua-platform":        `"Windows"`,
+			"Upgrade-Insecure-Requests": "1",
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-User":            "?1",
+			"Sec-Fetch-Dest":            "document",
+			"Accept-Encoding":           "gzip, deflate, br, zstd",
+			"Accept-Language":           "en-US,en;q=0.9",
+			"Priority":                  "u=0, i",
+		},
+		HeaderOrder: []HeaderPair{
+			{"sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`},
+			{"sec-ch-ua-mobile", "?0"},
+			{"sec-ch-ua-platform", `"Windows"`},
+			{"upgrade-insecure-requests", "1"},
+			{"user-agent", ""},
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-mode", "navigate"},
+			{"sec-fetch-user", "?1"},
+			{"sec-fetch-dest", "document"},
+			{"accept-encoding", "gzip, deflate, br, zstd"},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"priority", "u=0, i"},
+		},
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        65536,
+			EnablePush:             false,
+			MaxConcurrentStreams:   0,
+			InitialWindowSize:      6291456,
+			MaxFrameSize:           0,
+			MaxHeaderListSize:      262144,
+			ConnectionWindowUpdate: 15663105,
+			StreamWeight:           256,
+			StreamExclusive:        true,
+		},
+		TCPFingerprint: TCPFingerprint{},
+		SupportHTTP3: true,
+	}
+}
+
+// Chrome146Linux returns Chrome 146 with Linux platform
+func Chrome146Linux() *Preset {
+	return &Preset{
+		Name:                 "chrome-146-linux",
+		ClientHelloID:        tls.HelloChrome_146_Linux,
+		PSKClientHelloID:     tls.HelloChrome_146_Linux_PSK,
+		QUICClientHelloID:    tls.HelloChrome_146_QUIC,
+		QUICPSKClientHelloID: tls.HelloChrome_146_QUIC_PSK,
+		UserAgent:            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+		Headers: map[string]string{
+			"sec-ch-ua":                 `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`,
+			"sec-ch-ua-mobile":          "?0",
+			"sec-ch-ua-platform":        `"Linux"`,
+			"Upgrade-Insecure-Requests": "1",
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-User":            "?1",
+			"Sec-Fetch-Dest":            "document",
+			"Accept-Encoding":           "gzip, deflate, br, zstd",
+			"Accept-Language":           "en-US,en;q=0.9",
+			"Priority":                  "u=0, i",
+		},
+		HeaderOrder: []HeaderPair{
+			{"sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`},
+			{"sec-ch-ua-mobile", "?0"},
+			{"sec-ch-ua-platform", `"Linux"`},
+			{"upgrade-insecure-requests", "1"},
+			{"user-agent", ""},
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-mode", "navigate"},
+			{"sec-fetch-user", "?1"},
+			{"sec-fetch-dest", "document"},
+			{"accept-encoding", "gzip, deflate, br, zstd"},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"priority", "u=0, i"},
+		},
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        65536,
+			EnablePush:             false,
+			MaxConcurrentStreams:   0,
+			InitialWindowSize:      6291456,
+			MaxFrameSize:           0,
+			MaxHeaderListSize:      262144,
+			ConnectionWindowUpdate: 15663105,
+			StreamWeight:           256,
+			StreamExclusive:        true,
+		},
+		TCPFingerprint: TCPFingerprint{},
+		SupportHTTP3: true,
+	}
+}
+
+// Chrome146macOS returns Chrome 146 with macOS platform
+func Chrome146macOS() *Preset {
+	return &Preset{
+		Name:                 "chrome-146-macos",
+		ClientHelloID:        tls.HelloChrome_146_macOS,
+		PSKClientHelloID:     tls.HelloChrome_146_macOS_PSK,
+		QUICClientHelloID:    tls.HelloChrome_146_QUIC,
+		QUICPSKClientHelloID: tls.HelloChrome_146_QUIC_PSK,
+		UserAgent:            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+		Headers: map[string]string{
+			"sec-ch-ua":                 `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`,
+			"sec-ch-ua-mobile":          "?0",
+			"sec-ch-ua-platform":        `"macOS"`,
+			"Upgrade-Insecure-Requests": "1",
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-User":            "?1",
+			"Sec-Fetch-Dest":            "document",
+			"Accept-Encoding":           "gzip, deflate, br, zstd",
+			"Accept-Language":           "en-US,en;q=0.9",
+			"Priority":                  "u=0, i",
+		},
+		HeaderOrder: []HeaderPair{
+			{"sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`},
+			{"sec-ch-ua-mobile", "?0"},
+			{"sec-ch-ua-platform", `"macOS"`},
+			{"upgrade-insecure-requests", "1"},
+			{"user-agent", ""},
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-mode", "navigate"},
+			{"sec-fetch-user", "?1"},
+			{"sec-fetch-dest", "document"},
+			{"accept-encoding", "gzip, deflate, br, zstd"},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"priority", "u=0, i"},
+		},
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        65536,
+			EnablePush:             false,
+			MaxConcurrentStreams:   0,
+			InitialWindowSize:      6291456,
+			MaxFrameSize:           0,
+			MaxHeaderListSize:      262144,
+			ConnectionWindowUpdate: 15663105,
+			StreamWeight:           256,
+			StreamExclusive:        true,
+		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -744,6 +1255,7 @@ func Safari18() *Preset {
 			StreamExclusive:        false,
 			NoRFC7540Priorities:    true, // Safari sends NO_RFC7540_PRIORITIES=1
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -753,7 +1265,7 @@ func Safari18() *Preset {
 // WebKit doesn't support Client Hints, so no sec-ch-ua headers
 func IOSChrome143() *Preset {
 	return &Preset{
-		Name:              "ios-chrome-143",
+		Name:              "chrome-143-ios",
 		ClientHelloID:     tls.HelloIOS_18,      // iOS Chrome uses Safari's TLS (WebKit requirement)
 		QUICClientHelloID: tls.HelloIOS_18_QUIC, // iOS Chrome uses Safari's QUIC for H3
 		UserAgent:         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/143.0.6917.0 Mobile/15E148 Safari/604.1",
@@ -792,6 +1304,7 @@ func IOSChrome143() *Preset {
 			StreamExclusive:        false,
 			NoRFC7540Priorities:    true, // iOS sends NO_RFC7540_PRIORITIES=1
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -801,7 +1314,7 @@ func IOSChrome143() *Preset {
 // WebKit doesn't support Client Hints, so no sec-ch-ua headers
 func IOSChrome144() *Preset {
 	return &Preset{
-		Name:              "ios-chrome-144",
+		Name:              "chrome-144-ios",
 		ClientHelloID:     tls.HelloIOS_18,      // iOS Chrome uses Safari's TLS (WebKit requirement)
 		QUICClientHelloID: tls.HelloIOS_18_QUIC, // iOS Chrome uses Safari's QUIC for H3
 		UserAgent:         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/144.0.6917.0 Mobile/15E148 Safari/604.1",
@@ -840,6 +1353,55 @@ func IOSChrome144() *Preset {
 			StreamExclusive:        false,
 			NoRFC7540Priorities:    true, // iOS sends NO_RFC7540_PRIORITIES=1
 		},
+		TCPFingerprint: TCPFingerprint{},
+		SupportHTTP3: true,
+	}
+}
+
+// IOSChrome145 returns Chrome 145 on iOS fingerprint preset
+// Note: iOS Chrome uses WebKit (Apple requirement), so it has Safari's TLS AND HTTP/2 fingerprint
+// WebKit doesn't support Client Hints, so no sec-ch-ua headers
+func IOSChrome145() *Preset {
+	return &Preset{
+		Name:              "chrome-145-ios",
+		ClientHelloID:     tls.HelloIOS_18,      // iOS Chrome uses Safari's TLS (WebKit requirement)
+		QUICClientHelloID: tls.HelloIOS_18_QUIC, // iOS Chrome uses Safari's QUIC for H3
+		UserAgent:         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/145.0.6917.0 Mobile/15E148 Safari/604.1",
+		Headers: map[string]string{
+			// WebKit doesn't support Client Hints - no sec-ch-ua headers
+			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+			"Sec-Fetch-Site":  "none",
+			"Sec-Fetch-Dest":  "document",
+			"Accept-Encoding": "gzip, deflate, br",
+			"Sec-Fetch-Mode":  "navigate",
+			"Accept-Language": "en-US,en;q=0.9",
+			"Sec-Fetch-User":  "?1",
+		},
+		// Safari/WebKit header order (from real iOS Chrome capture)
+		HeaderOrder: []HeaderPair{
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-dest", "document"},
+			{"accept-encoding", "gzip, deflate, br"},
+			{"sec-fetch-mode", "navigate"},
+			{"user-agent", ""},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"sec-fetch-user", "?1"},
+		},
+		// Safari/WebKit HTTP/2 settings (from real iOS Chrome capture)
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        4096,
+			EnablePush:             false,
+			MaxConcurrentStreams:   100,
+			InitialWindowSize:      2097152,
+			MaxFrameSize:           16384,
+			MaxHeaderListSize:      0,
+			ConnectionWindowUpdate: 10485760,
+			StreamWeight:           255,
+			StreamExclusive:        false,
+			NoRFC7540Priorities:    true,
+		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -847,7 +1409,7 @@ func IOSChrome144() *Preset {
 // IOSSafari17 returns Safari 17 on iOS fingerprint preset
 func IOSSafari17() *Preset {
 	return &Preset{
-		Name:          "ios-safari-17",
+		Name:          "safari-17-ios",
 		ClientHelloID: tls.HelloIOS_14,
 		UserAgent:     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.7 Mobile/15E148 Safari/604.1",
 		Headers: map[string]string{
@@ -883,6 +1445,7 @@ func IOSSafari17() *Preset {
 			StreamExclusive:        false,
 			NoRFC7540Priorities:    true, // Safari uses m,s,p,a pseudo header order
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: false, // iOS Safari 17 doesn't have proper H3 TLS spec
 	}
 }
@@ -890,7 +1453,7 @@ func IOSSafari17() *Preset {
 // IOSSafari18 returns Safari 18 on iOS fingerprint preset
 func IOSSafari18() *Preset {
 	return &Preset{
-		Name:              "ios-safari-18",
+		Name:              "safari-18-ios",
 		ClientHelloID:     tls.HelloIOS_18,
 		QUICClientHelloID: tls.HelloIOS_18_QUIC, // iOS Safari QUIC for H3
 		UserAgent:         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
@@ -929,6 +1492,7 @@ func IOSSafari18() *Preset {
 			StreamExclusive:        false,
 			NoRFC7540Priorities:    true, // iOS sends NO_RFC7540_PRIORITIES=1
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -937,7 +1501,7 @@ func IOSSafari18() *Preset {
 // Note: Chrome on Android uses Chrome's TLS fingerprint (not WebKit restricted like iOS)
 func AndroidChrome143() *Preset {
 	return &Preset{
-		Name:                 "android-chrome-143",
+		Name:                 "chrome-143-android",
 		ClientHelloID:        tls.HelloChrome_143_Linux,     // Android Chrome uses Chrome's TLS
 		PSKClientHelloID:     tls.HelloChrome_143_Linux_PSK, // PSK for session resumption
 		QUICClientHelloID:    tls.HelloChrome_143_QUIC,      // QUIC for HTTP/3
@@ -982,12 +1546,13 @@ func AndroidChrome143() *Preset {
 			EnablePush:             false,
 			MaxConcurrentStreams:   0,
 			InitialWindowSize:      6291456,
-			MaxFrameSize:           16384,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
 			MaxHeaderListSize:      262144,
 			ConnectionWindowUpdate: 15663105,
 			StreamWeight:           256,
 			StreamExclusive:        true,
 		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -995,7 +1560,7 @@ func AndroidChrome143() *Preset {
 // AndroidChrome144 returns Chrome 144 on Android fingerprint preset
 func AndroidChrome144() *Preset {
 	return &Preset{
-		Name:                 "android-chrome-144",
+		Name:                 "chrome-144-android",
 		ClientHelloID:        tls.HelloChrome_144_Linux,
 		PSKClientHelloID:     tls.HelloChrome_144_Linux_PSK,
 		QUICClientHelloID:    tls.HelloChrome_144_QUIC,
@@ -1035,12 +1600,169 @@ func AndroidChrome144() *Preset {
 			EnablePush:             false,
 			MaxConcurrentStreams:   0,
 			InitialWindowSize:      6291456,
-			MaxFrameSize:           16384,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
 			MaxHeaderListSize:      262144,
 			ConnectionWindowUpdate: 15663105,
 			StreamWeight:           256,
 			StreamExclusive:        true,
 		},
+		TCPFingerprint: TCPFingerprint{},
+		SupportHTTP3: true,
+	}
+}
+
+// IOSChrome146 returns Chrome 146 on iOS fingerprint preset
+// Note: iOS Chrome uses WebKit (Apple requirement), so it has Safari's TLS AND HTTP/2 fingerprint
+// WebKit doesn't support Client Hints, so no sec-ch-ua headers
+func IOSChrome146() *Preset {
+	return &Preset{
+		Name:              "chrome-146-ios",
+		ClientHelloID:     tls.HelloIOS_18,      // iOS Chrome uses Safari's TLS (WebKit requirement)
+		QUICClientHelloID: tls.HelloIOS_18_QUIC, // iOS Chrome uses Safari's QUIC for H3
+		UserAgent:         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/146.0.6917.0 Mobile/15E148 Safari/604.1",
+		Headers: map[string]string{
+			// WebKit doesn't support Client Hints - no sec-ch-ua headers
+			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+			"Sec-Fetch-Site":  "none",
+			"Sec-Fetch-Dest":  "document",
+			"Accept-Encoding": "gzip, deflate, br",
+			"Sec-Fetch-Mode":  "navigate",
+			"Accept-Language": "en-US,en;q=0.9",
+			"Sec-Fetch-User":  "?1",
+		},
+		// Safari/WebKit header order (from real iOS Chrome capture)
+		HeaderOrder: []HeaderPair{
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-dest", "document"},
+			{"accept-encoding", "gzip, deflate, br"},
+			{"sec-fetch-mode", "navigate"},
+			{"user-agent", ""},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"sec-fetch-user", "?1"},
+		},
+		// Safari/WebKit HTTP/2 settings (from real iOS Chrome capture)
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        4096,
+			EnablePush:             false,
+			MaxConcurrentStreams:   100,
+			InitialWindowSize:      2097152,
+			MaxFrameSize:           16384,
+			MaxHeaderListSize:      0,
+			ConnectionWindowUpdate: 10485760,
+			StreamWeight:           255,
+			StreamExclusive:        false,
+			NoRFC7540Priorities:    true,
+		},
+		TCPFingerprint: TCPFingerprint{},
+		SupportHTTP3: true,
+	}
+}
+
+// AndroidChrome146 returns Chrome 146 on Android fingerprint preset
+func AndroidChrome146() *Preset {
+	return &Preset{
+		Name:                 "chrome-146-android",
+		ClientHelloID:        tls.HelloChrome_146_Linux,
+		PSKClientHelloID:     tls.HelloChrome_146_Linux_PSK,
+		QUICClientHelloID:    tls.HelloChrome_146_QUIC,
+		QUICPSKClientHelloID: tls.HelloChrome_146_QUIC_PSK,
+		UserAgent:        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36",
+		Headers: map[string]string{
+			"sec-ch-ua":                 `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`,
+			"sec-ch-ua-mobile":          "?1",
+			"sec-ch-ua-platform":        `"Android"`,
+			"Upgrade-Insecure-Requests": "1",
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-User":            "?1",
+			"Sec-Fetch-Dest":            "document",
+			"Accept-Encoding":           "gzip, deflate, br, zstd",
+			"Accept-Language":           "en-US,en;q=0.9",
+			"Priority":                  "u=0, i",
+		},
+		HeaderOrder: []HeaderPair{
+			{"sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`},
+			{"sec-ch-ua-mobile", "?1"},
+			{"sec-ch-ua-platform", `"Android"`},
+			{"upgrade-insecure-requests", "1"},
+			{"user-agent", ""},
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-mode", "navigate"},
+			{"sec-fetch-user", "?1"},
+			{"sec-fetch-dest", "document"},
+			{"accept-encoding", "gzip, deflate, br, zstd"},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"priority", "u=0, i"},
+		},
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        65536,
+			EnablePush:             false,
+			MaxConcurrentStreams:   0,
+			InitialWindowSize:      6291456,
+			MaxFrameSize:           0,
+			MaxHeaderListSize:      262144,
+			ConnectionWindowUpdate: 15663105,
+			StreamWeight:           256,
+			StreamExclusive:        true,
+		},
+		TCPFingerprint: TCPFingerprint{},
+		SupportHTTP3: true,
+	}
+}
+
+// AndroidChrome145 returns Chrome 145 on Android fingerprint preset
+func AndroidChrome145() *Preset {
+	return &Preset{
+		Name:                 "chrome-145-android",
+		ClientHelloID:        tls.HelloChrome_145_Linux,
+		PSKClientHelloID:     tls.HelloChrome_145_Linux_PSK,
+		QUICClientHelloID:    tls.HelloChrome_145_QUIC,
+		QUICPSKClientHelloID: tls.HelloChrome_145_QUIC_PSK,
+		UserAgent:        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36",
+		Headers: map[string]string{
+			"sec-ch-ua":                 `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`,
+			"sec-ch-ua-mobile":          "?1",
+			"sec-ch-ua-platform":        `"Android"`,
+			"Upgrade-Insecure-Requests": "1",
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-User":            "?1",
+			"Sec-Fetch-Dest":            "document",
+			"Accept-Encoding":           "gzip, deflate, br, zstd",
+			"Accept-Language":           "en-US,en;q=0.9",
+			"Priority":                  "u=0, i",
+		},
+		HeaderOrder: []HeaderPair{
+			{"sec-ch-ua", `"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"`},
+			{"sec-ch-ua-mobile", "?1"},
+			{"sec-ch-ua-platform", `"Android"`},
+			{"upgrade-insecure-requests", "1"},
+			{"user-agent", ""},
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-mode", "navigate"},
+			{"sec-fetch-user", "?1"},
+			{"sec-fetch-dest", "document"},
+			{"accept-encoding", "gzip, deflate, br, zstd"},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"priority", "u=0, i"},
+		},
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        65536,
+			EnablePush:             false,
+			MaxConcurrentStreams:   0,
+			InitialWindowSize:      6291456,
+			MaxFrameSize:           0, // Chrome omits setting 5 (16384 is RFC default)
+			MaxHeaderListSize:      262144,
+			ConnectionWindowUpdate: 15663105,
+			StreamWeight:           256,
+			StreamExclusive:        true,
+		},
+		TCPFingerprint: TCPFingerprint{},
 		SupportHTTP3: true,
 	}
 }
@@ -1057,25 +1779,52 @@ var presets = map[string]func() *Preset{
 	"chrome-144-windows": Chrome144Windows,
 	"chrome-144-linux":   Chrome144Linux,
 	"chrome-144-macos":   Chrome144macOS,
+	"chrome-145":         Chrome145,
+	"chrome-145-windows": Chrome145Windows,
+	"chrome-145-linux":   Chrome145Linux,
+	"chrome-145-macos":   Chrome145macOS,
+	"chrome-146":         Chrome146,
+	"chrome-146-windows": Chrome146Windows,
+	"chrome-146-linux":   Chrome146Linux,
+	"chrome-146-macos":   Chrome146macOS,
 	"firefox-133":        Firefox133,
 	"safari-18":          Safari18,
-	"ios-chrome-143":     IOSChrome143,
-	"ios-chrome-144":     IOSChrome144,
-	"ios-safari-17":      IOSSafari17,
-	"ios-safari-18":      IOSSafari18,
-	"android-chrome-143": AndroidChrome143,
-	"android-chrome-144": AndroidChrome144,
+	"chrome-143-ios":     IOSChrome143,
+	"chrome-144-ios":     IOSChrome144,
+	"chrome-145-ios":     IOSChrome145,
+	"chrome-146-ios":     IOSChrome146,
+	"safari-17-ios":      IOSSafari17,
+	"safari-18-ios":      IOSSafari18,
+	"chrome-143-android": AndroidChrome143,
+	"chrome-144-android": AndroidChrome144,
+	"chrome-145-android": AndroidChrome145,
+	"chrome-146-android": AndroidChrome146,
 
 	// -latest aliases (always point to the newest version)
-	"chrome-latest":         Chrome144,
-	"chrome-latest-windows": Chrome144Windows,
-	"chrome-latest-linux":   Chrome144Linux,
-	"chrome-latest-macos":   Chrome144macOS,
+	"chrome-latest":         Chrome146,
+	"chrome-latest-windows": Chrome146Windows,
+	"chrome-latest-linux":   Chrome146Linux,
+	"chrome-latest-macos":   Chrome146macOS,
 	"firefox-latest":        Firefox133,
 	"safari-latest":         Safari18,
-	"ios-chrome-latest":     IOSChrome144,
+	"chrome-latest-ios":     IOSChrome146,
+	"safari-latest-ios":     IOSSafari18,
+	"chrome-latest-android": AndroidChrome146,
+
+	// Backwards compatibility aliases (old naming convention)
+	"ios-chrome-143":        IOSChrome143,
+	"ios-chrome-144":        IOSChrome144,
+	"ios-chrome-145":        IOSChrome145,
+	"ios-chrome-146":        IOSChrome146,
+	"ios-safari-17":         IOSSafari17,
+	"ios-safari-18":         IOSSafari18,
+	"android-chrome-143":    AndroidChrome143,
+	"android-chrome-144":    AndroidChrome144,
+	"android-chrome-145":    AndroidChrome145,
+	"android-chrome-146":    AndroidChrome146,
+	"ios-chrome-latest":     IOSChrome146,
 	"ios-safari-latest":     IOSSafari18,
-	"android-chrome-latest": AndroidChrome144,
+	"android-chrome-latest": AndroidChrome146,
 }
 
 // Get returns a preset by name, or chrome-latest as default
@@ -1083,7 +1832,7 @@ func Get(name string) *Preset {
 	if fn, ok := presets[name]; ok {
 		return fn()
 	}
-	return Chrome144()
+	return Chrome146()
 }
 
 // Available returns a list of available preset names
