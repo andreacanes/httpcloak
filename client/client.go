@@ -992,18 +992,47 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 				newMethod = "GET"
 			}
 
+			// Browser-parity scrubbing on scheme downgrade / cross-origin.
+			// See session.requestWithRedirects for the same policy and rationale.
+			schemeDowngrade := isSchemeDowngradeClient(reqURL, redirectURL)
+			crossOrigin := !sameOriginClient(reqURL, redirectURL)
+
+			var carriedHeaders map[string][]string
+			if len(req.Headers) > 0 {
+				carriedHeaders = make(map[string][]string, len(req.Headers))
+				for k, v := range req.Headers {
+					lk := strings.ToLower(k)
+					if schemeDowngrade && lk == "referer" {
+						continue
+					}
+					if (crossOrigin || schemeDowngrade) && (lk == "authorization" || lk == "proxy-authorization") {
+						continue
+					}
+					carriedHeaders[k] = v
+				}
+			}
+
+			carriedReferer := reqURL
+			carriedAuth := req.Auth
+			if schemeDowngrade {
+				carriedReferer = ""
+				carriedAuth = nil
+			} else if crossOrigin {
+				carriedAuth = nil
+			}
+
 			// Create new request for redirect
 			newReq := &Request{
 				Method:          newMethod,
 				URL:             redirectURL,
-				Headers:         req.Headers,
+				Headers:         carriedHeaders,
 				Timeout:         req.Timeout,
 				UserAgent:       req.UserAgent,
 				ForceProtocol:   req.ForceProtocol,
 				FetchMode:       req.FetchMode,
 				FetchSite:       FetchSiteCrossSite, // Redirects are usually cross-site
-				Referer:         reqURL,
-				Auth:            req.Auth,
+				Referer:         carriedReferer,
+				Auth:            carriedAuth,
 				FollowRedirects: req.FollowRedirects,
 				MaxRedirects:    req.MaxRedirects,
 				DisableRetry:    true, // Don't retry redirects
@@ -1467,22 +1496,19 @@ func applyTLSOnlyHeaders(httpReq *http.Request, preset *fingerprint.Preset, req 
 	}
 
 	// Set header order for HTTP/2 and HTTP/3 fingerprinting
-	// Even in TLSOnly mode, header order matters for fingerprinting
+	// Use H2HeaderOrder (full HPACK position table) so user-supplied headers
+	// outside the default emit set (cache-control, content-type, cookie, …)
+	// land in their real-Chrome position instead of being appended at the end.
 	if len(customHeaderOrder) > 0 {
-		// Use custom header order
 		httpReq.Header[http.HeaderOrderKey] = customHeaderOrder
-	} else if len(preset.HeaderOrder) > 0 {
-		// Use preset's header order
-		order := make([]string, len(preset.HeaderOrder))
-		for i, hp := range preset.HeaderOrder {
-			order[i] = hp.Key
-		}
-		httpReq.Header[http.HeaderOrderKey] = order
+	} else {
+		httpReq.Header[http.HeaderOrderKey] = preset.H2HeaderOrder()
 	}
 
-	// Set pseudo-header order based on browser type
-	// Safari/iOS uses m,s,p,a; Chrome uses m,a,s,p
-	if preset.HTTP2Settings.NoRFC7540Priorities {
+	// Set pseudo-header order from preset H2Config (explicit > heuristic > Chrome default)
+	if order := preset.H2PseudoHeaderOrder(); order != nil {
+		httpReq.Header[http.PHeaderOrderKey] = order
+	} else if preset.HTTP2Settings.NoRFC7540Priorities {
 		httpReq.Header[http.PHeaderOrderKey] = []string{":method", ":scheme", ":path", ":authority"}
 	} else {
 		httpReq.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
@@ -1509,16 +1535,13 @@ func applyModeHeaders(httpReq *http.Request, preset *fingerprint.Preset, req *Re
 	}
 
 	// FIRST: Determine effective mode (BEFORE setting sec-fetch-site!)
-	// Smart mode detection: if user sets API-style Accept header, treat as CORS
-	// This prevents the "I want JSON but I'm navigating a document" incoherence
+	// Auto-detect CORS vs navigate from the request context so programmatic
+	// POSTs (fetch/XHR) don't get navigation headers that WAFs flag as bot
+	// traffic. NoCors is explicit and must not be overridden.
 	effectiveMode := req.FetchMode
 	if effectiveMode == FetchModeNavigate {
-		// Auto-detect CORS from Accept header, but only when mode is default Navigate
-		// NoCors mode is explicit and must not be overridden
-		if acceptValues, ok := getHeaderCaseInsensitive(req.Headers, "Accept"); ok && len(acceptValues) > 0 {
-			if isAPIAcceptHeader(acceptValues[0]) {
-				effectiveMode = FetchModeCORS
-			}
+		if sniffXHRMode(req) {
+			effectiveMode = FetchModeCORS
 		}
 	}
 
@@ -1537,13 +1560,11 @@ func applyModeHeaders(httpReq *http.Request, preset *fingerprint.Preset, req *Re
 		applyNavigationModeHeaders(httpReq, preset, req)
 	}
 
-	// Apply user custom headers, but BLOCK any that would break coherence
+	// Apply user custom headers. User wins over mode defaults — they can project
+	// any intent they want, including deliberate incoherence for site testing.
+	// The mode picker above already upgraded to CORS when their Sec-Fetch-*
+	// overrides implied one, so the final header set is already self-consistent.
 	for key, values := range req.Headers {
-		lowerKey := strings.ToLower(key)
-		// Skip headers that would break mode coherence
-		if isModeCriticalHeader(lowerKey) {
-			continue
-		}
 		for i, value := range values {
 			if i == 0 {
 				httpReq.Header.Set(key, value)
@@ -1554,31 +1575,19 @@ func applyModeHeaders(httpReq *http.Request, preset *fingerprint.Preset, req *Re
 	}
 
 	// Set header order for HTTP/2 and HTTP/3 fingerprinting
-	// Custom order takes precedence, then preset's protocol-specific order, then fallback
+	// Use H2HeaderOrder (full HPACK position table) — see the matching
+	// comment in transport.applyPresetHeaders for the rationale. Caller
+	// override still wins.
 	if len(customHeaderOrder) > 0 {
-		// Use custom header order
 		httpReq.Header[http.HeaderOrderKey] = customHeaderOrder
-	} else if len(preset.HeaderOrder) > 0 {
-		// Use preset's header order (H2/default)
-		order := make([]string, len(preset.HeaderOrder))
-		for i, hp := range preset.HeaderOrder {
-			order[i] = hp.Key
-		}
-		httpReq.Header[http.HeaderOrderKey] = order
 	} else {
-		// Fallback to hardcoded default (Chrome 143 order)
-		httpReq.Header[http.HeaderOrderKey] = []string{
-			"content-length", "sec-ch-ua-platform", "user-agent", "sec-ch-ua",
-			"content-type", "sec-ch-ua-mobile", "accept", "origin",
-			"sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest",
-			"referer", "accept-encoding", "accept-language", "priority",
-			"upgrade-insecure-requests", "cookie",
-		}
+		httpReq.Header[http.HeaderOrderKey] = preset.H2HeaderOrder()
 	}
 
-	// Set pseudo-header order based on browser type
-	// Safari/iOS uses m,s,p,a; Chrome uses m,a,s,p
-	if preset.HTTP2Settings.NoRFC7540Priorities {
+	// Set pseudo-header order from preset H2Config (explicit > heuristic > Chrome default)
+	if order := preset.H2PseudoHeaderOrder(); order != nil {
+		httpReq.Header[http.PHeaderOrderKey] = order
+	} else if preset.HTTP2Settings.NoRFC7540Priorities {
 		httpReq.Header[http.PHeaderOrderKey] = []string{":method", ":scheme", ":path", ":authority"}
 	} else {
 		httpReq.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
@@ -1596,24 +1605,97 @@ func isAPIAcceptHeader(accept string) bool {
 		(lower == "*/*")
 }
 
-// isModeCriticalHeader returns true if this header is controlled by the mode
-// These headers MUST be coherent with each other - user cannot override individually
-func isModeCriticalHeader(lowerKey string) bool {
-	critical := map[string]bool{
-		"accept":                    true,
-		"sec-fetch-mode":            true,
-		"sec-fetch-dest":            true,
-		"sec-fetch-user":            true,
-		"sec-fetch-site":            true,
-		"upgrade-insecure-requests": true,
-		"origin":                    true,
-	}
-	return critical[lowerKey]
+// isFormContentType returns true for Content-Type values that a browser sends
+// on a classic <form method=POST> submission. These POSTs stay navigation mode.
+func isFormContentType(ct string) bool {
+	lower := strings.ToLower(ct)
+	return strings.HasPrefix(lower, "application/x-www-form-urlencoded") ||
+		strings.HasPrefix(lower, "multipart/form-data")
 }
 
+// isAPIContentType returns true for Content-Type values that indicate a
+// programmatic XHR/fetch call (JSON APIs, protobuf, raw binary uploads).
+func isAPIContentType(ct string) bool {
+	lower := strings.ToLower(ct)
+	return strings.HasPrefix(lower, "application/json") ||
+		strings.HasPrefix(lower, "application/xml") ||
+		strings.HasPrefix(lower, "application/octet-stream") ||
+		strings.HasPrefix(lower, "application/grpc") ||
+		strings.HasPrefix(lower, "application/x-protobuf") ||
+		strings.HasPrefix(lower, "text/plain") ||
+		// Any other application/* that isn't a form type is API-ish enough
+		(strings.HasPrefix(lower, "application/") && !isFormContentType(lower))
+}
+
+// sniffXHRMode decides whether a request with default FetchMode should be
+// upgraded to CORS. Browsers only emit navigation sec-fetch-* for real top-level
+// navigations (user click, address bar) and classic <form> POSTs; everything
+// else — fetch()/XHR/sendBeacon — is CORS or no-cors. Libraries like Python
+// httpcloak.Session.post() have to infer intent from the request shape.
+func sniffXHRMode(req *Request) bool {
+	method := strings.ToUpper(req.Method)
+
+	// Explicit user override on the Sec-Fetch-Mode / Sec-Fetch-Dest headers
+	// wins. "navigate" forces navigation even for a POST that would otherwise
+	// sniff as CORS (e.g. SPA that wants to mimic a form submission).
+	if v, ok := getHeaderCaseInsensitive(req.Headers, "Sec-Fetch-Mode"); ok && len(v) > 0 {
+		switch strings.ToLower(v[0]) {
+		case "cors", "no-cors", "websocket":
+			return true
+		case "navigate":
+			return false
+		}
+	}
+	if v, ok := getHeaderCaseInsensitive(req.Headers, "Sec-Fetch-Dest"); ok && len(v) > 0 {
+		// "document" is the only dest compatible with navigate mode — treat
+		// an explicit "document" as a nav signal, anything else as API.
+		if strings.ToLower(v[0]) == "document" {
+			return false
+		}
+		return true
+	}
+
+	// Accept-header sniff works for any method — keeps prior GET behavior.
+	if accept, ok := getHeaderCaseInsensitive(req.Headers, "Accept"); ok && len(accept) > 0 {
+		if isAPIAcceptHeader(accept[0]) {
+			return true
+		}
+	}
+
+	switch method {
+	case "GET", "HEAD", "OPTIONS", "":
+		// No body-carrying methods: stay navigate unless Accept hinted API
+		// (handled above).
+		return false
+	case "DELETE":
+		// DELETE is never a navigation; Chrome sends cors/empty.
+		return true
+	}
+
+	// Body-carrying methods (POST/PUT/PATCH/etc). Use Content-Type to
+	// distinguish form submissions (navigate) from programmatic calls (cors).
+	if ct, ok := getHeaderCaseInsensitive(req.Headers, "Content-Type"); ok && len(ct) > 0 {
+		if isFormContentType(ct[0]) {
+			return false
+		}
+		if isAPIContentType(ct[0]) {
+			return true
+		}
+	}
+
+	// Unknown Content-Type on a body-carrying method: lean CORS. Real-world
+	// POSTs from Python/Node scrapers are overwhelmingly API calls; form
+	// submissions always carry one of the form Content-Types above.
+	return true
+}
+
+
 // applyNavigationModeHeaders sets headers for page navigation (human clicked link)
+// Uses preset's values for Accept/Accept-Encoding/Accept-Language when available,
+// falls back to Chrome defaults. Always adds navigation headers (sec-fetch, etc.)
+// so non-browser presets still pass bot detection.
 func applyNavigationModeHeaders(httpReq *http.Request, preset *fingerprint.Preset, req *Request) {
-	// Client hints (low-entropy only)
+	// Client hints (low-entropy only) — only if preset has them (browsers do, OkHttp doesn't)
 	if v, ok := preset.Headers["sec-ch-ua"]; ok {
 		httpReq.Header.Set("Sec-Ch-Ua", v)
 	}
@@ -1624,19 +1706,37 @@ func applyNavigationModeHeaders(httpReq *http.Request, preset *fingerprint.Prese
 		httpReq.Header.Set("Sec-Ch-Ua-Platform", v)
 	}
 
-	// Navigation headers - THE coherent set for "human clicked a link"
-	// Note: cache-control is NOT sent on normal navigation, only on hard refresh (Ctrl+F5)
-	httpReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-	httpReq.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	httpReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	// Content negotiation — use preset values, fall back to Chrome defaults
+	if v, ok := preset.Headers["Accept"]; ok {
+		httpReq.Header.Set("Accept", v)
+	} else {
+		httpReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+	}
+	if v, ok := preset.Headers["Accept-Encoding"]; ok {
+		httpReq.Header.Set("Accept-Encoding", v)
+	} else {
+		httpReq.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	}
+	if v, ok := preset.Headers["Accept-Language"]; ok {
+		httpReq.Header.Set("Accept-Language", v)
+	} else {
+		httpReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	}
+
+	// Navigation headers — always set for bot detection
 	httpReq.Header.Set("Sec-Fetch-Dest", "document")
 	httpReq.Header.Set("Sec-Fetch-Mode", "navigate")
 	httpReq.Header.Set("Sec-Fetch-User", "?1")
 	httpReq.Header.Set("Upgrade-Insecure-Requests", "1")
 
-	// Priority header (newer Chrome)
+	// Priority header (newer Chrome/Firefox)
 	if v, ok := preset.Headers["Priority"]; ok {
 		httpReq.Header.Set("Priority", v)
+	}
+
+	// TE header (Firefox sends te: trailers)
+	if v, ok := preset.Headers["TE"]; ok {
+		httpReq.Header.Set("TE", v)
 	}
 }
 
@@ -1660,8 +1760,17 @@ func applyCORSModeHeaders(httpReq *http.Request, preset *fingerprint.Preset, req
 	} else {
 		httpReq.Header.Set("Accept", "*/*")
 	}
-	httpReq.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	httpReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	// Use preset's Accept-Encoding/Language if available, else Chrome defaults
+	if v, ok := preset.Headers["Accept-Encoding"]; ok {
+		httpReq.Header.Set("Accept-Encoding", v)
+	} else {
+		httpReq.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	}
+	if v, ok := preset.Headers["Accept-Language"]; ok {
+		httpReq.Header.Set("Accept-Language", v)
+	} else {
+		httpReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	}
 	httpReq.Header.Set("Sec-Fetch-Dest", "empty")
 	httpReq.Header.Set("Sec-Fetch-Mode", "cors")
 	// NO Sec-Fetch-User for CORS
@@ -1852,4 +1961,42 @@ func decompress(data []byte, encoding string) ([]byte, error) {
 		// Unknown encoding, return as-is
 		return data, nil
 	}
+}
+
+// parseOriginClient returns (scheme, host, port) with default ports filled in.
+// Used to gate header scrubbing on scheme downgrade / cross-origin redirects.
+func parseOriginClient(urlStr string) (scheme, host, port string) {
+	u, err := url.Parse(urlStr)
+	if err != nil || u.Scheme == "" {
+		return "", "", ""
+	}
+	scheme = strings.ToLower(u.Scheme)
+	host = strings.ToLower(u.Hostname())
+	port = u.Port()
+	if port == "" {
+		switch scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		}
+	}
+	return scheme, host, port
+}
+
+// sameOriginClient reports whether two URLs share scheme+host+port.
+func sameOriginClient(a, b string) bool {
+	as, ah, ap := parseOriginClient(a)
+	bs, bh, bp := parseOriginClient(b)
+	if as == "" || bs == "" {
+		return false
+	}
+	return as == bs && ah == bh && ap == bp
+}
+
+// isSchemeDowngradeClient reports whether a redirect goes https → http.
+func isSchemeDowngradeClient(from, to string) bool {
+	fs, _, _ := parseOriginClient(from)
+	ts, _, _ := parseOriginClient(to)
+	return fs == "https" && ts == "http"
 }

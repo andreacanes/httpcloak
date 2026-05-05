@@ -64,6 +64,11 @@ type Preset struct {
 	HTTP2Settings     HTTP2Settings
 	TCPFingerprint    TCPFingerprint
 	SupportHTTP3      bool
+	H2Config          *H2FingerprintConfig // nil = Chrome defaults for all H2 fingerprinting
+	H3Config          *H3FingerprintConfig // nil = Chrome defaults for all H3/QUIC fingerprinting
+	JA3               string               // JA3 fingerprint string. When set, parsed fresh per connection instead of using ClientHelloID.
+	JA3Extras         *JA3Extras           // Supplements JA3 parsing. nil = Chrome defaults.
+	BasedOn           string               // For custom presets: name of the parent preset (used by inheritance-loop detection). Empty for built-ins.
 }
 
 // TCPFingerprint contains TCP/IP stack parameters that identify the OS.
@@ -121,6 +126,567 @@ type HTTP2Settings struct {
 	NoRFC7540Priorities bool
 }
 
+// H2FingerprintConfig controls HTTP/2 fingerprinting behavior beyond SETTINGS frame values.
+// When nil on a Preset, all getters return Chrome defaults. Individual nil/zero fields
+// also fall back to Chrome defaults, so you can override just the fields you need.
+type H2FingerprintConfig struct {
+	HPACKHeaderOrder    []string // HPACK wire encoding order. nil = Chrome 143 default.
+	HPACKIndexingPolicy string   // "chrome"/"never"/"always"/"default". "" = "chrome".
+	HPACKNeverIndex     []string // Headers never HPACK-indexed. nil = Chrome default.
+	StreamPriorityMode  string   // "chrome"/"default". "" = "chrome".
+	DisableCookieSplit  *bool    // nil = true (Chrome sends single cookie entry).
+	SettingsOrder       []uint16 // H2 SETTINGS frame ID order. nil = dynamic from HTTP2Settings.
+	PseudoHeaderOrder   []string // Pseudo-header order. nil = heuristic (Chrome m,a,s,p / Safari m,s,p,a).
+
+	// PriorityTable maps sec-fetch-dest values to RFC 7540 stream priorities and
+	// the matching RFC 9218 priority: header value. Populated for browsers (e.g.
+	// Chrome 147 desktop) that emit a different urgency per resource type.
+	//
+	// When nil, the transport uses HTTP2Settings.StreamWeight / StreamExclusive
+	// for every request — the legacy single-weight behaviour. When non-nil, the
+	// transport selects an entry based on the request's sec-fetch-dest header,
+	// derives the H2 wire weight from urgency via PriorityFromUrgency, and
+	// injects the priority: header per the RFC 9218 emission rules.
+	//
+	// Map keys are sec-fetch-dest values exactly as Chrome emits them
+	// ("document", "image", "script", "empty", etc.). Lookups are case-sensitive.
+	PriorityTable map[string]ResourcePriority
+}
+
+// ResourcePriority describes a single browser priority decision for one
+// resource class (sec-fetch-dest). Three orthogonal facts:
+//
+//   - Urgency (0–7) drives the RFC 7540 H2 stream weight via the formula
+//     weight = 256 - (urgency * 73) / 2. 3 is Chrome's internal default and
+//     emits no `u=` parameter on the priority: header.
+//   - Incremental flag drives the RFC 9218 `i` parameter on the priority:
+//     header. The H2 wire frame ignores it (RFC 7540 has no incremental).
+//   - EmitHeader controls whether the priority: HTTP header is sent at all.
+//     Chrome omits the header entirely on async/defer scripts even though
+//     the wire weight defaults to 147 (urgency=3). The wire frame is still
+//     emitted; only the HTTP header is suppressed.
+type ResourcePriority struct {
+	Urgency     uint8 // 0–7; 3 = default (no `u=` on header)
+	Incremental bool  // RFC 9218 `i` parameter
+	EmitHeader  bool  // false → suppress the priority: HTTP header entirely
+}
+
+// chromePriorityDefaultUrgency is Chrome's internal default urgency when no
+// resource-type override applies. The header omits `u=N` at this value.
+const chromePriorityDefaultUrgency uint8 = 3
+
+// defaultPriorityTable is the Chrome 147 desktop priority mapping captured
+// from real Chrome traffic. It serves as the implicit fallback for any
+// preset that uses RFC 7540 priorities (NoRFC7540Priorities=false) and
+// doesn't define its own H2Config.PriorityTable. Presets with
+// NoRFC7540Priorities=true (Safari, iOS Chrome, iOS Safari) opt out
+// entirely — those don't emit the RFC 7540 PRIORITY frame at all.
+//
+// Rationale: real browsers vary the H2 stream weight per resource type;
+// emitting a constant weight on every HEADERS frame is detectable by
+// passive H2 fingerprinters. The Chrome 147 table is the best per-dest
+// approximation we have ground-truth captures for. Firefox has slightly
+// different urgencies in its RFC 9218 emission; until we have Firefox
+// captures, Firefox will inherit this Chrome-shaped table — a closer
+// approximation than the prior single-weight fallback, but not byte-exact
+// to real Firefox. Override per-preset by setting H2Config.PriorityTable
+// to either an explicit table (use that) or an empty map (disable
+// priority emission entirely).
+var defaultPriorityTable = map[string]ResourcePriority{
+	"audio":    {Urgency: 3, Incremental: true, EmitHeader: true},
+	"document": {Urgency: 0, Incremental: true, EmitHeader: true},
+	"embed":    {Urgency: 0, Incremental: true, EmitHeader: true},
+	"empty":    {Urgency: 1, Incremental: true, EmitHeader: true},
+	"font":     {Urgency: 1, Incremental: false, EmitHeader: true},
+	"iframe":   {Urgency: 0, Incremental: true, EmitHeader: true},
+	"image":    {Urgency: 2, Incremental: true, EmitHeader: true},
+	"manifest": {Urgency: 2, Incremental: false, EmitHeader: true},
+	"object":   {Urgency: 0, Incremental: true, EmitHeader: true},
+	"script":   {Urgency: 1, Incremental: false, EmitHeader: true},
+	"style":    {Urgency: 0, Incremental: false, EmitHeader: true},
+	"track":    {Urgency: 3, Incremental: true, EmitHeader: true},
+	"video":    {Urgency: 3, Incremental: true, EmitHeader: true},
+	"worker":   {Urgency: 4, Incremental: true, EmitHeader: true},
+}
+
+// DefaultPriorityTable returns a copy of the package-level default
+// priority table. Callers can use this as a starting point when
+// constructing custom per-preset tables, or to inspect the values that
+// will be emitted for presets that don't define their own.
+//
+// The returned map is a fresh copy; mutating it does not affect future
+// preset lookups.
+func DefaultPriorityTable() map[string]ResourcePriority {
+	out := make(map[string]ResourcePriority, len(defaultPriorityTable))
+	for k, v := range defaultPriorityTable {
+		out[k] = v
+	}
+	return out
+}
+
+// PriorityFromUrgency converts an RFC 9218 urgency value into the RFC 7540
+// stream weight Chrome emits on the H2 HEADERS frame. Verified against
+// Chrome 147 captures for urgency 0–4; the formula extrapolates linearly
+// for 5–7 (Chrome doesn't emit those values in practice).
+//
+// Formula: weight = 256 - (urgency * 73) / 2  (integer division).
+//
+// Mapping: 0→256, 1→220, 2→183, 3→147, 4→110, 5→74, 6→37, 7→1.
+//
+// The returned weight is the *effective* weight (1–256). Wire format uses
+// weight-1; conversion happens at the transport boundary.
+func PriorityFromUrgency(urgency uint8) uint16 {
+	if urgency > 7 {
+		urgency = 7
+	}
+	return uint16(256 - (uint32(urgency)*73)/2)
+}
+
+// PriorityHeaderFromResource renders the RFC 9218 priority: HTTP header
+// value for a ResourcePriority, applying Chrome's emission rules:
+//
+//	urgency=3 (default) + !incremental → ""        (omit the header)
+//	urgency=3 (default) +  incremental → "i"
+//	urgency≠3           + !incremental → "u=N"
+//	urgency≠3           +  incremental → "u=N, i"
+//
+// EmitHeader=false short-circuits to "" regardless of urgency/incremental
+// (Chrome's async/defer-script behaviour). Caller must skip injection when
+// the result is empty.
+func PriorityHeaderFromResource(rp ResourcePriority) string {
+	if !rp.EmitHeader {
+		return ""
+	}
+	uIsDefault := rp.Urgency == chromePriorityDefaultUrgency
+	switch {
+	case uIsDefault && !rp.Incremental:
+		return ""
+	case uIsDefault && rp.Incremental:
+		return "i"
+	case !uIsDefault && !rp.Incremental:
+		return "u=" + uint8ToASCII(rp.Urgency)
+	default: // !uIsDefault && rp.Incremental
+		return "u=" + uint8ToASCII(rp.Urgency) + ", i"
+	}
+}
+
+// uint8ToASCII formats a small uint8 (0–9 expected for urgency) without the
+// strconv dependency cost. Falls back to direct conversion for >9 (which
+// shouldn't occur — urgency is 0–7).
+func uint8ToASCII(v uint8) string {
+	if v <= 9 {
+		return string([]byte{'0' + v})
+	}
+	// Two-digit fallback for safety; never reached for valid urgency.
+	return string([]byte{'0' + v/10, '0' + v%10})
+}
+
+// H3FingerprintConfig controls HTTP/3 and QUIC fingerprinting behavior.
+// When nil on a Preset, all getters return Chrome defaults (with Safari fallback
+// for presets that have NoRFC7540Priorities set). Individual nil fields fall back
+// to Chrome defaults independently.
+type H3FingerprintConfig struct {
+	QPACKMaxTableCapacity    *uint64 // nil = 65536 (Chrome). Safari heuristic fallback.
+	QPACKBlockedStreams      *uint64 // nil = 100
+	MaxFieldSectionSize      *uint64 // nil = 262144 (Chrome). 0 to omit (Safari).
+	EnableDatagrams          *bool   // nil = true (Chrome). Safari heuristic fallback.
+	QUICInitialPacketSize    *uint16 // nil = 1250 (Chrome). MASQUE overrides to 1350.
+	QUICMaxIncomingStreams    *int64  // nil = 100
+	QUICMaxIncomingUniStreams *int64  // nil = 103
+	QUICAllow0RTT            *bool   // nil = true
+	QUICChromeStyleInitial   *bool   // nil = true
+	QUICDisableHelloScramble *bool   // nil = true
+	QUICTransportParamOrder  string  // "chrome"/"random". "" = "chrome".
+	QUICConnectionIDLength   *int    // nil = 0 (Chrome empty SCID). Firefox uses 8.
+	QUICMaxDatagramFrameSize *uint64 // nil = 65536 (Chrome). 0 to use quic-go default (16383).
+	MaxResponseHeaderBytes   *uint64 // nil = 262144
+	SendGreaseFrames         *bool   // nil = true
+
+	// QUIC flow-control windows. quic-go translates these to wire transport
+	// parameters initial_max_data (4) and initial_max_stream_data_* (5/6/7).
+	// nil = quic-go default (~7.5 MB conn, ~512 KB stream). Safari/iOS Chrome
+	// uses larger conn (16 MB) and smaller per-stream (2 MB) — set both to
+	// match.
+	QUICInitialStreamReceiveWindow     *uint64 // nil = quic-go default. iOS Chrome sends 2097152.
+	QUICInitialConnectionReceiveWindow *uint64 // nil = quic-go default. iOS Chrome sends 16777216.
+}
+
+// --- H2 Preset Getters ---
+// Each getter checks H2Config first, then returns Chrome default.
+
+// H2HeaderOrder returns the HPACK wire encoding order for HTTP/2 headers.
+func (p *Preset) H2HeaderOrder() []string {
+	if p.H2Config != nil && p.H2Config.HPACKHeaderOrder != nil {
+		return p.H2Config.HPACKHeaderOrder
+	}
+	// Chrome 143 header order (verified via tls.peet.ws)
+	return []string{
+		"cache-control",
+		"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+		"upgrade-insecure-requests", "user-agent",
+		"content-type", "content-length",
+		"accept", "origin",
+		"sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest",
+		"referer",
+		"accept-encoding", "accept-language",
+		"cookie", "priority",
+	}
+}
+
+// H2HPACKIndexingPolicy returns the HPACK indexing policy name.
+func (p *Preset) H2HPACKIndexingPolicy() string {
+	if p.H2Config != nil && p.H2Config.HPACKIndexingPolicy != "" {
+		return p.H2Config.HPACKIndexingPolicy
+	}
+	return "chrome"
+}
+
+// H2HPACKNeverIndex returns headers that should never be HPACK-indexed.
+func (p *Preset) H2HPACKNeverIndex() []string {
+	if p.H2Config != nil && p.H2Config.HPACKNeverIndex != nil {
+		return p.H2Config.HPACKNeverIndex
+	}
+	return []string{"cookie", "authorization", "proxy-authorization"}
+}
+
+// H2StreamPriorityMode returns the stream priority mode name.
+func (p *Preset) H2StreamPriorityMode() string {
+	if p.H2Config != nil && p.H2Config.StreamPriorityMode != "" {
+		return p.H2Config.StreamPriorityMode
+	}
+	return "chrome"
+}
+
+// H2DisableCookieSplit returns whether to disable cookie splitting.
+// Chrome sends cookies as one HPACK entry (true), Firefox splits per RFC 9113 (false).
+func (p *Preset) H2DisableCookieSplit() bool {
+	if p.H2Config != nil && p.H2Config.DisableCookieSplit != nil {
+		return *p.H2Config.DisableCookieSplit
+	}
+	return true // Chrome default
+}
+
+// H2SettingsOrder returns the explicit H2 SETTINGS frame ID order.
+// nil signals "use dynamic builder" (existing behavior).
+func (p *Preset) H2SettingsOrder() []uint16 {
+	if p.H2Config != nil && p.H2Config.SettingsOrder != nil {
+		return p.H2Config.SettingsOrder
+	}
+	return nil
+}
+
+// H2PseudoHeaderOrder returns the pseudo-header order for HTTP/2.
+// nil signals "use heuristic" (Chrome m,a,s,p / Safari m,s,p,a).
+func (p *Preset) H2PseudoHeaderOrder() []string {
+	if p.H2Config != nil && p.H2Config.PseudoHeaderOrder != nil {
+		return p.H2Config.PseudoHeaderOrder
+	}
+	return nil
+}
+
+// H2HasPriorityTable reports whether this preset will resolve per-dest
+// priority data. Three states:
+//
+//   - H2Config.PriorityTable populated (len > 0) → true (explicit override).
+//   - H2Config.PriorityTable nil or empty AND NoRFC7540Priorities=false →
+//     true (inherits the package-level defaultPriorityTable).
+//   - NoRFC7540Priorities=true → false (Safari / iOS Chrome / iOS Safari
+//     opt out of RFC 7540 priorities entirely; the wire frame is not
+//     emitted).
+//
+// When false, callers fall back to the legacy HTTP2Settings.StreamWeight
+// / StreamExclusive single-weight behaviour. To genuinely disable priority
+// emission for a single preset, set NoRFC7540Priorities=true on its
+// HTTP2Settings — the priority_table mechanism is purely additive.
+func (p *Preset) H2HasPriorityTable() bool {
+	if p.H2Config != nil && len(p.H2Config.PriorityTable) > 0 {
+		return true
+	}
+	if p.HTTP2Settings.NoRFC7540Priorities {
+		return false
+	}
+	return len(defaultPriorityTable) > 0
+}
+
+// H2PriorityFor returns the resolved (weight, exclusive, headerValue) for
+// a given sec-fetch-dest. Resolution order:
+//
+//  1. Preset's explicit H2Config.PriorityTable (when populated, len > 0).
+//  2. Package-level defaultPriorityTable, but only if the preset uses
+//     RFC 7540 priorities (NoRFC7540Priorities=false).
+//
+// ok=false in two cases:
+//   - the preset opts out of RFC 7540 priorities entirely (Safari etc.), or
+//   - the dest is not registered in whichever table applies.
+//
+// In both cases the caller should fall back to
+// HTTP2Settings.StreamWeight / StreamExclusive (legacy behaviour).
+//
+// weight is the effective weight (1–256). The transport converts to wire
+// format (weight-1) at the boundary.
+//
+// headerValue is the RFC 9218 priority: header value rendered per the
+// emission rules; empty string means "do not inject the header" (caller
+// must skip Set/Add for this request).
+//
+// Lookup is case-sensitive — Chrome emits "document", "image", etc. as
+// lowercase ASCII. Pass req.Header.Get("Sec-Fetch-Dest") directly.
+func (p *Preset) H2PriorityFor(dest string) (weight uint16, exclusive bool, headerValue string, ok bool) {
+	var table map[string]ResourcePriority
+	switch {
+	case p.H2Config != nil && len(p.H2Config.PriorityTable) > 0:
+		table = p.H2Config.PriorityTable
+	case p.HTTP2Settings.NoRFC7540Priorities:
+		return 0, false, "", false
+	default:
+		table = defaultPriorityTable
+	}
+	rp, found := table[dest]
+	if !found {
+		return 0, false, "", false
+	}
+	return PriorityFromUrgency(rp.Urgency), true, PriorityHeaderFromResource(rp), true
+}
+
+// --- H3 Preset Getters ---
+// Each getter checks H3Config first, then uses Safari heuristic (NoRFC7540Priorities)
+// where applicable, then returns Chrome default.
+
+// H3QPACKMaxTableCapacity returns the QPACK max dynamic table capacity.
+func (p *Preset) H3QPACKMaxTableCapacity() uint64 {
+	if p.H3Config != nil && p.H3Config.QPACKMaxTableCapacity != nil {
+		return *p.H3Config.QPACKMaxTableCapacity
+	}
+	// Safari heuristic fallback
+	if p.HTTP2Settings.NoRFC7540Priorities {
+		return 16383
+	}
+	return 65536 // Chrome default
+}
+
+// H3QPACKBlockedStreams returns the QPACK blocked streams limit.
+func (p *Preset) H3QPACKBlockedStreams() uint64 {
+	if p.H3Config != nil && p.H3Config.QPACKBlockedStreams != nil {
+		return *p.H3Config.QPACKBlockedStreams
+	}
+	return 100
+}
+
+// H3MaxFieldSectionSize returns the max field section size.
+// 0 means omit the setting (Safari behavior).
+func (p *Preset) H3MaxFieldSectionSize() uint64 {
+	if p.H3Config != nil && p.H3Config.MaxFieldSectionSize != nil {
+		return *p.H3Config.MaxFieldSectionSize
+	}
+	// Safari heuristic: omit MAX_FIELD_SECTION_SIZE
+	if p.HTTP2Settings.NoRFC7540Priorities {
+		return 0
+	}
+	return 262144 // Chrome default
+}
+
+// H3EnableDatagrams returns whether to enable H3 datagrams.
+func (p *Preset) H3EnableDatagrams() bool {
+	if p.H3Config != nil && p.H3Config.EnableDatagrams != nil {
+		return *p.H3Config.EnableDatagrams
+	}
+	// Safari heuristic: no datagrams
+	if p.HTTP2Settings.NoRFC7540Priorities {
+		return false
+	}
+	return true // Chrome default
+}
+
+// H3QUICInitialPacketSize returns the QUIC initial packet size.
+func (p *Preset) H3QUICInitialPacketSize() uint16 {
+	if p.H3Config != nil && p.H3Config.QUICInitialPacketSize != nil {
+		return *p.H3Config.QUICInitialPacketSize
+	}
+	return 1250 // Chrome default
+}
+
+// H3QUICMaxIncomingStreams returns the max incoming bidirectional streams.
+func (p *Preset) H3QUICMaxIncomingStreams() int64 {
+	if p.H3Config != nil && p.H3Config.QUICMaxIncomingStreams != nil {
+		return *p.H3Config.QUICMaxIncomingStreams
+	}
+	return 100
+}
+
+// H3QUICMaxIncomingUniStreams returns the max incoming unidirectional streams.
+func (p *Preset) H3QUICMaxIncomingUniStreams() int64 {
+	if p.H3Config != nil && p.H3Config.QUICMaxIncomingUniStreams != nil {
+		return *p.H3Config.QUICMaxIncomingUniStreams
+	}
+	return 103
+}
+
+// H3QUICAllow0RTT returns whether to allow 0-RTT.
+func (p *Preset) H3QUICAllow0RTT() bool {
+	if p.H3Config != nil && p.H3Config.QUICAllow0RTT != nil {
+		return *p.H3Config.QUICAllow0RTT
+	}
+	return true
+}
+
+// H3QUICChromeStyleInitial returns whether to use Chrome-style initial packets.
+func (p *Preset) H3QUICChromeStyleInitial() bool {
+	if p.H3Config != nil && p.H3Config.QUICChromeStyleInitial != nil {
+		return *p.H3Config.QUICChromeStyleInitial
+	}
+	return true
+}
+
+// H3QUICDisableHelloScramble returns whether to disable ClientHello scrambling.
+func (p *Preset) H3QUICDisableHelloScramble() bool {
+	if p.H3Config != nil && p.H3Config.QUICDisableHelloScramble != nil {
+		return *p.H3Config.QUICDisableHelloScramble
+	}
+	return true
+}
+
+// H3QUICTransportParamOrder returns the QUIC transport parameter order mode name.
+func (p *Preset) H3QUICTransportParamOrder() string {
+	if p.H3Config != nil && p.H3Config.QUICTransportParamOrder != "" {
+		return p.H3Config.QUICTransportParamOrder
+	}
+	return "chrome"
+}
+
+// H3QUICConnectionIDLength returns the QUIC connection ID length in bytes.
+// Chrome uses 0 (empty SCID), Firefox uses 8.
+func (p *Preset) H3QUICConnectionIDLength() int {
+	if p.H3Config != nil && p.H3Config.QUICConnectionIDLength != nil {
+		return *p.H3Config.QUICConnectionIDLength
+	}
+	return 0 // Chrome default: empty SCID
+}
+
+// H3QUICMaxDatagramFrameSize returns the max_datagram_frame_size transport parameter.
+// Chrome uses 65536, default quic-go is 16383.
+func (p *Preset) H3QUICMaxDatagramFrameSize() uint64 {
+	if p.H3Config != nil && p.H3Config.QUICMaxDatagramFrameSize != nil {
+		return *p.H3Config.QUICMaxDatagramFrameSize
+	}
+	return 65536 // Chrome default
+}
+
+// H3MaxResponseHeaderBytes returns the max response header bytes.
+func (p *Preset) H3MaxResponseHeaderBytes() uint64 {
+	if p.H3Config != nil && p.H3Config.MaxResponseHeaderBytes != nil {
+		return *p.H3Config.MaxResponseHeaderBytes
+	}
+	return 262144
+}
+
+// H3SendGreaseFrames returns whether to send GREASE frames on the control stream.
+func (p *Preset) H3SendGreaseFrames() bool {
+	if p.H3Config != nil && p.H3Config.SendGreaseFrames != nil {
+		return *p.H3Config.SendGreaseFrames
+	}
+	return true
+}
+
+// H3QUICInitialStreamReceiveWindow returns the quic-go InitialStreamReceiveWindow
+// value (which becomes initial_max_stream_data_* on the wire). 0 means
+// "use quic-go default" (~512 KB). iOS Chrome sets 2 MiB.
+func (p *Preset) H3QUICInitialStreamReceiveWindow() uint64 {
+	if p.H3Config != nil && p.H3Config.QUICInitialStreamReceiveWindow != nil {
+		return *p.H3Config.QUICInitialStreamReceiveWindow
+	}
+	return 0
+}
+
+// H3QUICInitialConnectionReceiveWindow returns the quic-go InitialConnectionReceiveWindow
+// value (which becomes initial_max_data on the wire). 0 means
+// "use quic-go default" (~7.5 MB). iOS Chrome sets 16 MiB.
+func (p *Preset) H3QUICInitialConnectionReceiveWindow() uint64 {
+	if p.H3Config != nil && p.H3Config.QUICInitialConnectionReceiveWindow != nil {
+		return *p.H3Config.QUICInitialConnectionReceiveWindow
+	}
+	return 0
+}
+
+// chromeH2Config returns the explicit H2 fingerprint config for Chrome presets.
+func chromeH2Config() *H2FingerprintConfig {
+	t := true
+	return &H2FingerprintConfig{
+		HPACKHeaderOrder: []string{
+			"cache-control",
+			"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+			"upgrade-insecure-requests", "user-agent",
+			"content-type", "content-length",
+			"accept", "origin",
+			"sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest",
+			"referer",
+			"accept-encoding", "accept-language",
+			"cookie", "priority",
+		},
+		HPACKIndexingPolicy: "chrome",
+		StreamPriorityMode:  "chrome",
+		DisableCookieSplit:  &t,
+		SettingsOrder:       []uint16{1, 2, 4, 6},
+		PseudoHeaderOrder:   []string{":method", ":authority", ":scheme", ":path"},
+	}
+}
+
+// firefoxH2Config returns the explicit H2 fingerprint config for Firefox presets.
+func firefoxH2Config() *H2FingerprintConfig {
+	f := false
+	return &H2FingerprintConfig{
+		HPACKHeaderOrder: []string{
+			"user-agent",
+			"accept", "accept-language", "accept-encoding",
+			"upgrade-insecure-requests",
+			"sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user",
+			"priority", "te",
+			"referer", "cookie",
+			"content-type", "content-length", "origin",
+		},
+		HPACKIndexingPolicy: "default",
+		StreamPriorityMode:  "default",
+		DisableCookieSplit:  &f,
+		SettingsOrder:       []uint16{1, 2, 4, 5},
+		PseudoHeaderOrder:   []string{":method", ":path", ":authority", ":scheme"},
+	}
+}
+
+// safariH2Config returns the explicit H2 fingerprint config for Safari/WebKit presets.
+func safariH2Config() *H2FingerprintConfig {
+	t := true
+	return &H2FingerprintConfig{
+		HPACKHeaderOrder: []string{
+			"accept",
+			"sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user",
+			"accept-language", "accept-encoding",
+			"user-agent", "referer", "cookie",
+			"content-type", "content-length", "origin",
+		},
+		HPACKIndexingPolicy: "default",
+		StreamPriorityMode:  "default",
+		DisableCookieSplit:  &t,
+		SettingsOrder:       []uint16{2, 4, 3, 5, 9},
+		PseudoHeaderOrder:   []string{":method", ":scheme", ":path", ":authority"},
+	}
+}
+
+// safariH3Config returns the explicit H3 fingerprint config for Safari/WebKit presets.
+// Replaces the NoRFC7540Priorities heuristic fallback with explicit values.
+func safariH3Config() *H3FingerprintConfig {
+	f := false
+	qpackCap := uint64(16383)
+	maxField := uint64(0) // Safari omits MAX_FIELD_SECTION_SIZE
+	return &H3FingerprintConfig{
+		QPACKMaxTableCapacity:    &qpackCap,
+		MaxFieldSectionSize:      &maxField,
+		EnableDatagrams:          &f,
+		QUICChromeStyleInitial:   &f, // Safari doesn't mimic Chrome's initial packet pattern
+		QUICDisableHelloScramble: &f, // Safari uses default scrambling
+		QUICTransportParamOrder:  "random",
+		SendGreaseFrames:         &f, // Safari doesn't send GREASE frames on control stream
+	}
+}
+
 // Chrome133 returns the Chrome 133 fingerprint preset
 func Chrome133() *Preset {
 	p := GetPlatformInfo()
@@ -173,6 +739,7 @@ func Chrome133() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: false, // Legacy preset, no proper QUIC fingerprint
 	}
 }
@@ -229,6 +796,7 @@ func Chrome141() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: false, // Legacy preset, no proper QUIC fingerprint
 	}
 }
@@ -272,7 +840,98 @@ func Firefox133() *Preset {
 			StreamExclusive:        false,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       firefoxH2Config(),
 		SupportHTTP3: false, // No Firefox QUIC fingerprint in utls
+	}
+}
+
+// Firefox148 returns the Firefox 148 fingerprint preset using JA3 for TLS.
+// Uses the exact JA3 fingerprint captured from real Firefox 148 on Linux.
+func Firefox148() *Preset {
+	p := GetPlatformInfo()
+	// Firefox 148 UA format
+	firefoxUA := "Mozilla/5.0 " + p.FirefoxUserAgentOS + " Gecko/20100101 Firefox/148.0"
+	// Override the rv: version in the UA OS string for Firefox 148
+	if p.Platform == "Windows" {
+		firefoxUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0"
+	} else if p.Platform == "macOS" {
+		firefoxUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:148.0) Gecko/20100101 Firefox/148.0"
+	} else {
+		firefoxUA = "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0"
+	}
+	return &Preset{
+		Name: "firefox-148",
+		// JA3 from real Firefox 148 capture (tls.peet.ws)
+		JA3: "771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-156-157-47-53,0-23-65281-10-11-35-16-5-34-18-51-43-13-45-28-27-65037,4588-29-23-24-25-256-257,0",
+		JA3Extras: &JA3Extras{
+			SignatureAlgorithms: []tls.SignatureScheme{
+				tls.ECDSAWithP256AndSHA256,
+				tls.ECDSAWithP384AndSHA384,
+				tls.ECDSAWithP521AndSHA512,
+				tls.PSSWithSHA256,
+				tls.PSSWithSHA384,
+				tls.PSSWithSHA512,
+				tls.PKCS1WithSHA256,
+				tls.PKCS1WithSHA384,
+				tls.PKCS1WithSHA512,
+				tls.ECDSAWithSHA1,
+				tls.PKCS1WithSHA1,
+			},
+			DelegatedCredentialAlgorithms: []tls.SignatureScheme{
+				tls.ECDSAWithP256AndSHA256,
+				tls.ECDSAWithP384AndSHA384,
+				tls.ECDSAWithP521AndSHA512,
+				tls.ECDSAWithSHA1,
+			},
+			ALPN: []string{"h2", "http/1.1"},
+			CertCompAlgs: []tls.CertCompressionAlgo{
+				tls.CertCompressionZlib,
+				tls.CertCompressionBrotli,
+				tls.CertCompressionZstd,
+			},
+			RecordSizeLimit:  0x4001,
+			KeyShareCurves:   3, // Firefox sends key shares for X25519MLKEM768, X25519, P-256
+		},
+		UserAgent: firefoxUA,
+		Headers: map[string]string{
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+			"Accept-Language":           "en-US,en;q=0.9",
+			"Accept-Encoding":           "gzip, deflate, br, zstd",
+			"Upgrade-Insecure-Requests": "1",
+			"Sec-Fetch-Dest":            "document",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-User":            "?1",
+			"Priority":                  "u=0, i",
+			"TE":                        "trailers",
+		},
+		HeaderOrder: []HeaderPair{
+			{"user-agent", ""},
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+			{"accept-language", "en-US,en;q=0.9"},
+			{"accept-encoding", "gzip, deflate, br, zstd"},
+			{"upgrade-insecure-requests", "1"},
+			{"sec-fetch-dest", "document"},
+			{"sec-fetch-mode", "navigate"},
+			{"sec-fetch-site", "none"},
+			{"sec-fetch-user", "?1"},
+			{"priority", "u=0, i"},
+			{"te", "trailers"},
+		},
+		HTTP2Settings: HTTP2Settings{
+			HeaderTableSize:        65536,
+			EnablePush:             false, // Firefox 148 sends ENABLE_PUSH=0
+			MaxConcurrentStreams:   0,
+			InitialWindowSize:      131072,
+			MaxFrameSize:           16384,
+			MaxHeaderListSize:      0,
+			ConnectionWindowUpdate: 12517377,
+			StreamWeight:           42,
+			StreamExclusive:        false,
+		},
+		TCPFingerprint: TCPFingerprint{},
+		H2Config:       firefoxH2Config(),
+		SupportHTTP3:   false, // No Firefox QUIC fingerprint in utls
 	}
 }
 
@@ -345,6 +1004,7 @@ func Chrome143() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -403,6 +1063,7 @@ func Chrome143Windows() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -461,6 +1122,7 @@ func Chrome143Linux() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -519,6 +1181,7 @@ func Chrome143macOS() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -587,6 +1250,7 @@ func Chrome144() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -641,6 +1305,7 @@ func Chrome144Windows() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -695,6 +1360,7 @@ func Chrome144Linux() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -749,6 +1415,7 @@ func Chrome144macOS() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -817,6 +1484,7 @@ func Chrome145() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -871,6 +1539,7 @@ func Chrome145Windows() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -925,6 +1594,7 @@ func Chrome145Linux() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -979,6 +1649,7 @@ func Chrome145macOS() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1047,6 +1718,7 @@ func Chrome146() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1101,6 +1773,7 @@ func Chrome146Windows() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1155,6 +1828,7 @@ func Chrome146Linux() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1209,6 +1883,7 @@ func Chrome146macOS() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1256,8 +1931,93 @@ func Safari18() *Preset {
 			NoRFC7540Priorities:    true, // Safari sends NO_RFC7540_PRIORITIES=1
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       safariH2Config(),
+		H3Config:       safariH3Config(),
 		SupportHTTP3: true,
 	}
+}
+
+// Chrome147Windows returns Chrome 147 with Windows platform.
+//
+// The preset is provided by the embedded JSON registry (fingerprint/embedded/chrome-147-windows.json),
+// which inherits TLS bytes from chrome-146-windows and overrides only the User-Agent
+// and sec-ch-ua header. If the embedded JSON failed to load, the factory falls back
+// to Chrome146Windows so callers don't get a Chrome146 fallback by accident.
+func Chrome147Windows() *Preset {
+	if p := LookupCustom("chrome-147-windows"); p != nil {
+		return p
+	}
+	return Chrome146Windows()
+}
+
+// Chrome147Linux returns Chrome 147 with Linux platform. See Chrome147Windows.
+func Chrome147Linux() *Preset {
+	if p := LookupCustom("chrome-147-linux"); p != nil {
+		return p
+	}
+	return Chrome146Linux()
+}
+
+// Chrome147macOS returns Chrome 147 with macOS platform. See Chrome147Windows.
+func Chrome147macOS() *Preset {
+	if p := LookupCustom("chrome-147-macos"); p != nil {
+		return p
+	}
+	return Chrome146macOS()
+}
+
+// Chrome147 returns the Chrome 147 fingerprint preset auto-detected from the
+// running OS. Mirrors Chrome146's platform-aware behavior.
+func Chrome147() *Preset {
+	switch GetPlatformInfo().Platform {
+	case "Windows":
+		return Chrome147Windows()
+	case "macOS":
+		return Chrome147macOS()
+	default:
+		return Chrome147Linux()
+	}
+}
+
+// IOSChrome147 returns Chrome 147 on iOS. Embedded JSON only overrides the
+// User-Agent (CriOS major version) — everything else (no sec-ch-ua due to
+// WebKit, Safari TLS via HelloIOS_18, Safari H2 config) inherits unchanged
+// from chrome-146-ios. Falls back to IOSChrome146 if the JSON didn't load.
+func IOSChrome147() *Preset {
+	if p := LookupCustom("chrome-147-ios"); p != nil {
+		return p
+	}
+	return IOSChrome146()
+}
+
+// IOSChrome148 returns Chrome 148 on iOS — captured against real iOS Chrome
+// 148.0.7778.47, with deeper changes than the 147 bump:
+//   - User-Agent: iOS 26_4_2, CriOS/148.0.7778.47
+//   - HTTP/2 wire: SettingsOrder [2,3,4,9] (drops MAX_FRAME_SIZE), pseudo-order
+//     m,s,a,p (was m,s,p,a in safariH2Config), ConnectionWindowUpdate 10420225
+//   - HTTP/2 headers: priority added, sec-fetch-user removed, accept-encoding
+//     gains zstd, header order completely reshuffled
+//   - HTTP/3 QUIC: 2 MiB stream / 16 MiB connection flow control, 8 max
+//     incoming uni streams (vs Chrome's 103). TLS bytes (HelloIOS_18,
+//     HelloIOS_18_QUIC) match Chrome 146 iOS exactly — no utls update needed
+//
+// Note: chrome-146-ios and chrome-147-ios are intentionally NOT updated; this
+// preset captures the deeper iOS-Chrome-specific divergences as of 148 only.
+func IOSChrome148() *Preset {
+	if p := LookupCustom("chrome-148-ios"); p != nil {
+		return p
+	}
+	return IOSChrome146()
+}
+
+// AndroidChrome147 returns Chrome 147 on Android. Same diff pattern as
+// desktop (UA bump + sec-ch-ua brand rotation); inherits Linux-flavored
+// TLS from chrome-146-android. Falls back to AndroidChrome146.
+func AndroidChrome147() *Preset {
+	if p := LookupCustom("chrome-147-android"); p != nil {
+		return p
+	}
+	return AndroidChrome146()
 }
 
 // IOSChrome143 returns Chrome 143 on iOS fingerprint preset
@@ -1305,6 +2065,8 @@ func IOSChrome143() *Preset {
 			NoRFC7540Priorities:    true, // iOS sends NO_RFC7540_PRIORITIES=1
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       safariH2Config(),
+		H3Config:       safariH3Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1354,6 +2116,8 @@ func IOSChrome144() *Preset {
 			NoRFC7540Priorities:    true, // iOS sends NO_RFC7540_PRIORITIES=1
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       safariH2Config(),
+		H3Config:       safariH3Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1402,6 +2166,8 @@ func IOSChrome145() *Preset {
 			NoRFC7540Priorities:    true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       safariH2Config(),
+		H3Config:       safariH3Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1446,6 +2212,8 @@ func IOSSafari17() *Preset {
 			NoRFC7540Priorities:    true, // Safari uses m,s,p,a pseudo header order
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       safariH2Config(),
+		H3Config:       safariH3Config(),
 		SupportHTTP3: false, // iOS Safari 17 doesn't have proper H3 TLS spec
 	}
 }
@@ -1493,6 +2261,8 @@ func IOSSafari18() *Preset {
 			NoRFC7540Priorities:    true, // iOS sends NO_RFC7540_PRIORITIES=1
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       safariH2Config(),
+		H3Config:       safariH3Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1553,6 +2323,7 @@ func AndroidChrome143() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1607,6 +2378,7 @@ func AndroidChrome144() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1655,6 +2427,8 @@ func IOSChrome146() *Preset {
 			NoRFC7540Priorities:    true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       safariH2Config(),
+		H3Config:       safariH3Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1709,6 +2483,7 @@ func AndroidChrome146() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1763,6 +2538,7 @@ func AndroidChrome145() *Preset {
 			StreamExclusive:        true,
 		},
 		TCPFingerprint: TCPFingerprint{},
+		H2Config:       chromeH2Config(),
 		SupportHTTP3: true,
 	}
 }
@@ -1787,7 +2563,12 @@ var presets = map[string]func() *Preset{
 	"chrome-146-windows": Chrome146Windows,
 	"chrome-146-linux":   Chrome146Linux,
 	"chrome-146-macos":   Chrome146macOS,
+	"chrome-147":         Chrome147,
+	"chrome-147-windows": Chrome147Windows,
+	"chrome-147-linux":   Chrome147Linux,
+	"chrome-147-macos":   Chrome147macOS,
 	"firefox-133":        Firefox133,
+	"firefox-148":        Firefox148,
 	"safari-18":          Safari18,
 	"chrome-143-ios":     IOSChrome143,
 	"chrome-144-ios":     IOSChrome144,
@@ -1799,40 +2580,61 @@ var presets = map[string]func() *Preset{
 	"chrome-144-android": AndroidChrome144,
 	"chrome-145-android": AndroidChrome145,
 	"chrome-146-android": AndroidChrome146,
+	"chrome-147-ios":     IOSChrome147,
+	"chrome-147-android": AndroidChrome147,
+	"chrome-148-ios":     IOSChrome148,
 
 	// -latest aliases (always point to the newest version)
-	"chrome-latest":         Chrome146,
-	"chrome-latest-windows": Chrome146Windows,
-	"chrome-latest-linux":   Chrome146Linux,
-	"chrome-latest-macos":   Chrome146macOS,
-	"firefox-latest":        Firefox133,
+	"chrome-latest":         Chrome147,
+	"chrome-latest-windows": Chrome147Windows,
+	"chrome-latest-linux":   Chrome147Linux,
+	"chrome-latest-macos":   Chrome147macOS,
+	"firefox-latest":        Firefox148,
 	"safari-latest":         Safari18,
-	"chrome-latest-ios":     IOSChrome146,
+	"chrome-latest-ios":     IOSChrome148,
 	"safari-latest-ios":     IOSSafari18,
-	"chrome-latest-android": AndroidChrome146,
+	"chrome-latest-android": AndroidChrome147,
 
 	// Backwards compatibility aliases (old naming convention)
 	"ios-chrome-143":        IOSChrome143,
 	"ios-chrome-144":        IOSChrome144,
 	"ios-chrome-145":        IOSChrome145,
 	"ios-chrome-146":        IOSChrome146,
+	"ios-chrome-147":        IOSChrome147,
+	"ios-chrome-148":        IOSChrome148,
 	"ios-safari-17":         IOSSafari17,
 	"ios-safari-18":         IOSSafari18,
 	"android-chrome-143":    AndroidChrome143,
 	"android-chrome-144":    AndroidChrome144,
 	"android-chrome-145":    AndroidChrome145,
 	"android-chrome-146":    AndroidChrome146,
-	"ios-chrome-latest":     IOSChrome146,
+	"android-chrome-147":    AndroidChrome147,
+	"ios-chrome-latest":     IOSChrome148,
 	"ios-safari-latest":     IOSSafari18,
-	"android-chrome-latest": AndroidChrome146,
+	"android-chrome-latest": AndroidChrome147,
 }
 
-// Get returns a preset by name, or chrome-latest as default
+// Get returns a preset by name. Checks custom registry first, then built-in
+// presets. Falls back to Chrome146 if not found.
 func Get(name string) *Preset {
+	if p := LookupCustom(name); p != nil {
+		return p
+	}
 	if fn, ok := presets[name]; ok {
 		return fn()
 	}
 	return Chrome146()
+}
+
+// GetStrict returns a preset by name, returning nil if not found (no fallback).
+func GetStrict(name string) *Preset {
+	if p := LookupCustom(name); p != nil {
+		return p
+	}
+	if fn, ok := presets[name]; ok {
+		return fn()
+	}
+	return nil
 }
 
 // Available returns a list of available preset names

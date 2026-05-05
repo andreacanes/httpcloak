@@ -1770,25 +1770,83 @@ func applyPresetHeaders(httpReq *http.Request, preset *fingerprint.Preset, custo
 		}
 		httpReq.Header.Set("User-Agent", preset.UserAgent)
 
-		// Auto-detect CORS mode from user's Accept header.
-		// If the user sends an API-style Accept (application/json, */*, etc.),
-		// adjust sec-fetch headers to CORS mode instead of Navigate.
-		// This prevents sending browser navigation headers to API endpoints,
-		// which WAFs like Incapsula flag as bot behavior.
-		if isAPIRequest(userHeaders) {
-			httpReq.Header.Set("Sec-Fetch-Mode", "cors")
-			httpReq.Header.Set("Sec-Fetch-Dest", "empty")
-			httpReq.Header.Set("Sec-Fetch-Site", "cross-site")
+		// Auto-detect CORS mode from the request shape. Real browsers use
+		// cors/empty Sec-Fetch-* for fetch()/XHR and navigate/document for
+		// top-level navigations + classic <form> POSTs; infer which one this
+		// request is from method, Content-Type, Accept, and any user-supplied
+		// Sec-Fetch-* headers. WAFs like Akamai flag navigation headers on
+		// API endpoints as bot behavior.
+		if sniffXHRMode(httpReq.Method, userHeaders) {
+			// Preserve any explicitly user-supplied Sec-Fetch-Mode/Dest/Site;
+			// the sniff coercion is for "user said nothing, infer XHR" — once
+			// they pin a value (e.g. mode=no-cors, dest=image, site=same-origin)
+			// the request shape is intentional and our preset header defaults
+			// (which assume navigation) should yield. Without this, callers
+			// can't request browser sub-resource fetches like preload-as=image.
+			userMode := headerVal(userHeaders, "Sec-Fetch-Mode")
+			userDest := headerVal(userHeaders, "Sec-Fetch-Dest")
+			userSite := headerVal(userHeaders, "Sec-Fetch-Site")
+			if userMode != "" {
+				httpReq.Header.Set("Sec-Fetch-Mode", userMode)
+			} else {
+				httpReq.Header.Set("Sec-Fetch-Mode", "cors")
+			}
+			if userDest != "" {
+				httpReq.Header.Set("Sec-Fetch-Dest", userDest)
+			} else {
+				httpReq.Header.Set("Sec-Fetch-Dest", "empty")
+			}
+			if userSite != "" {
+				httpReq.Header.Set("Sec-Fetch-Site", userSite)
+			} else {
+				httpReq.Header.Set("Sec-Fetch-Site", "cross-site")
+			}
 			httpReq.Header.Del("Sec-Fetch-User")
 			httpReq.Header.Del("sec-fetch-user")
 			httpReq.Header.Del("Upgrade-Insecure-Requests")
 			httpReq.Header.Del("upgrade-insecure-requests")
+			// Real browsers send Accept: */* on fetch()/XHR unless the user
+			// explicitly asked for something else — no user Accept means swap
+			// the navigation Accept (text/html,...) for the CORS default.
+			if headerVal(userHeaders, "Accept") == "" {
+				httpReq.Header.Set("Accept", "*/*")
+			}
 			// CORS uses u=1,i priority (lower urgency than navigation's u=0,i)
+			// — used as the static fallback when the preset has no per-dest
+			// PriorityTable. Presets that ship a PriorityTable (Chrome 147+)
+			// override this below.
 			if httpReq.Header.Get("Priority") != "" {
 				httpReq.Header.Set("Priority", "u=1, i")
 			}
 			if httpReq.Header.Get("priority") != "" {
 				httpReq.Header.Set("priority", "u=1, i")
+			}
+		}
+
+		// Per-resource-type priority: HTTP header. Chrome 147+ desktop emits
+		// a distinct urgency per sec-fetch-dest (style→u=0, script→u=1,
+		// manifest→u=2, image→u=2/i, fetch→u=1/i, prefetch→u=4/i, …). Presets
+		// that ship a PriorityTable apply that mapping here AFTER the XHR
+		// detector runs (so Sec-Fetch-Dest is final). Presets without a table
+		// retain the static priority set by HeaderOrder / sniffXHRMode above.
+		//
+		// Skip on HTTP/1.1 — Chrome never sends the priority: header on H1;
+		// the H1 strip below handles cleanup either way.
+		if (protocol == "h2" || protocol == "h3") && preset.H2HasPriorityTable() {
+			dest := httpReq.Header.Get("Sec-Fetch-Dest")
+			if _, _, hv, ok := preset.H2PriorityFor(dest); ok {
+				if hv == "" {
+					// Chrome omits the header for this dest (e.g. async/defer scripts).
+					httpReq.Header.Del("Priority")
+					httpReq.Header.Del("priority")
+				} else {
+					httpReq.Header.Set("Priority", hv)
+					// Mirror the lowercase form for callers that bypassed Set's
+					// canonicalization when constructing the request.
+					if _, hasLower := httpReq.Header["priority"]; hasLower {
+						httpReq.Header["priority"] = []string{hv}
+					}
+				}
 			}
 		}
 
@@ -1807,55 +1865,132 @@ func applyPresetHeaders(httpReq *http.Request, preset *fingerprint.Preset, custo
 
 	// Set header order for HTTP/2 and HTTP/3 fingerprinting
 	// Chrome uses the same header order for both H2 and H3 (same request_->extra_headers vector)
+	//
+	// Important: use H2HeaderOrder() (the full HPACK position table) — NOT
+	// preset.HeaderOrder (the default emit set). The two differ: HeaderOrder
+	// only lists headers Chrome sends on every request, while H2HeaderOrder
+	// also reserves slots for situational headers (cache-control on F5,
+	// content-type/content-length on POST, origin/referer on cross-origin,
+	// cookie on subsequent requests). Using HeaderOrder here was a real
+	// fingerprinting bug — when callers added cache-control/content-type/
+	// cookie, the fork couldn't slot them and appended them after `priority`
+	// instead of placing them where real Chrome does.
 	if len(customHeaderOrder) > 0 {
 		httpReq.Header[http.HeaderOrderKey] = customHeaderOrder
-	} else if len(preset.HeaderOrder) > 0 {
-		order := make([]string, len(preset.HeaderOrder))
-		for i, hp := range preset.HeaderOrder {
-			order[i] = hp.Key
-		}
-		httpReq.Header[http.HeaderOrderKey] = order
 	} else {
-		// Fallback to hardcoded default (Chrome 143 order)
-		httpReq.Header[http.HeaderOrderKey] = []string{
-			"content-length", "sec-ch-ua-platform", "user-agent", "sec-ch-ua",
-			"content-type", "sec-ch-ua-mobile", "accept", "origin",
-			"sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest",
-			"referer", "accept-encoding", "accept-language", "priority",
-			"upgrade-insecure-requests", "cookie",
-		}
+		httpReq.Header[http.HeaderOrderKey] = preset.H2HeaderOrder()
 	}
 
-	// Set pseudo-header order: custom (Akamai) > browser-type heuristic
+	// Set pseudo-header order: custom (Akamai) > preset H2Config > heuristic
 	if len(customPseudoOrder) > 0 {
 		httpReq.Header[http.PHeaderOrderKey] = customPseudoOrder
+	} else if order := preset.H2PseudoHeaderOrder(); order != nil {
+		httpReq.Header[http.PHeaderOrderKey] = order
 	} else if preset.HTTP2Settings.NoRFC7540Priorities {
-		// Safari/iOS uses m,s,p,a
 		httpReq.Header[http.PHeaderOrderKey] = []string{":method", ":scheme", ":path", ":authority"}
 	} else {
-		// Chrome uses m,a,s,p
 		httpReq.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
 	}
 }
 
-// isAPIRequest detects if user headers indicate an API call (not browser navigation).
-// Checks Accept header for API content types like application/json, */*, etc.
-func isAPIRequest(userHeaders map[string][]string) bool {
-	if userHeaders == nil {
-		return false
-	}
-	// Case-insensitive lookup for Accept header
-	for k, v := range userHeaders {
-		if strings.EqualFold(k, "Accept") && len(v) > 0 {
-			lower := strings.ToLower(v[0])
-			return strings.Contains(lower, "application/json") ||
-				strings.Contains(lower, "application/xml") ||
-				strings.Contains(lower, "text/plain") ||
-				strings.Contains(lower, "application/octet-stream") ||
-				lower == "*/*"
+// sniffXHRMode decides whether a request should send CORS-mode Sec-Fetch-*
+// instead of navigation-mode, based on the request method and user headers.
+// Browsers send cors/empty for fetch()/XHR and navigate/document for top-level
+// navigations + classic <form> POSTs. Libraries that don't know the user's
+// intent (session.post / httpcloak_post) have to infer it from the request
+// shape.
+func sniffXHRMode(method string, userHeaders map[string][]string) bool {
+	method = strings.ToUpper(method)
+
+	// Explicit user override on Sec-Fetch-Mode / Sec-Fetch-Dest wins — the
+	// caller knows what intent they want to project. "navigate" explicitly
+	// asks for navigation mode even for a POST that would otherwise sniff
+	// as CORS.
+	if v := headerVal(userHeaders, "Sec-Fetch-Mode"); v != "" {
+		switch strings.ToLower(v) {
+		case "cors", "no-cors", "websocket":
+			return true
+		case "navigate":
+			return false
 		}
 	}
-	return false
+	if v := headerVal(userHeaders, "Sec-Fetch-Dest"); v != "" {
+		// "document" is the only dest compatible with navigate mode — treat
+		// an explicit "document" as a nav signal, anything else as API.
+		if strings.ToLower(v) == "document" {
+			return false
+		}
+		return true
+	}
+
+	// API-style Accept flags any method (also keeps prior GET behavior).
+	if v := headerVal(userHeaders, "Accept"); v != "" && isAPIAcceptValue(v) {
+		return true
+	}
+
+	switch method {
+	case "GET", "HEAD", "OPTIONS", "":
+		// Bodyless methods stay navigate unless Accept hinted API (above).
+		return false
+	case "DELETE":
+		// DELETE is never a navigation.
+		return true
+	}
+
+	// Body-carrying methods (POST/PUT/PATCH/...). Use Content-Type to
+	// distinguish form submissions (navigate) from programmatic calls (cors).
+	if ct := headerVal(userHeaders, "Content-Type"); ct != "" {
+		if isFormContentTypeValue(ct) {
+			return false
+		}
+		if isAPIContentTypeValue(ct) {
+			return true
+		}
+	}
+
+	// Unknown Content-Type on a body-carrying method: lean CORS. Real-world
+	// POSTs from scrapers are overwhelmingly API calls; form submissions
+	// always carry one of the form Content-Types handled above.
+	return true
+}
+
+func headerVal(h map[string][]string, name string) string {
+	if h == nil {
+		return ""
+	}
+	for k, v := range h {
+		if strings.EqualFold(k, name) && len(v) > 0 {
+			return v[0]
+		}
+	}
+	return ""
+}
+
+func isAPIAcceptValue(accept string) bool {
+	lower := strings.ToLower(accept)
+	return strings.Contains(lower, "application/json") ||
+		strings.Contains(lower, "application/xml") ||
+		strings.Contains(lower, "text/plain") ||
+		strings.Contains(lower, "application/octet-stream") ||
+		lower == "*/*"
+}
+
+func isFormContentTypeValue(ct string) bool {
+	lower := strings.ToLower(ct)
+	return strings.HasPrefix(lower, "application/x-www-form-urlencoded") ||
+		strings.HasPrefix(lower, "multipart/form-data")
+}
+
+func isAPIContentTypeValue(ct string) bool {
+	lower := strings.ToLower(ct)
+	return strings.HasPrefix(lower, "application/json") ||
+		strings.HasPrefix(lower, "application/xml") ||
+		strings.HasPrefix(lower, "application/octet-stream") ||
+		strings.HasPrefix(lower, "application/grpc") ||
+		strings.HasPrefix(lower, "application/x-protobuf") ||
+		strings.HasPrefix(lower, "text/plain") ||
+		// Any other application/* that isn't a form type is API-ish.
+		(strings.HasPrefix(lower, "application/") && !isFormContentTypeValue(lower))
 }
 
 // isChromePreset returns true if the preset name indicates a Chrome fingerprint.

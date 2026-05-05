@@ -403,8 +403,15 @@ class Response:
             body = raw_body.decode("utf-8", errors="replace")
         else:
             body = data.get("body", "")
+            encoding = data.get("body_encoding", "")
             if isinstance(body, str):
-                body_bytes = body.encode("utf-8")
+                if encoding == "base64":
+                    # Go side base64-encodes bodies that aren't valid UTF-8 so binary
+                    # (PDFs, images, compressed streams) survives the JSON round trip.
+                    body_bytes = base64.b64decode(body)
+                    body = body_bytes.decode("utf-8", errors="replace")
+                else:
+                    body_bytes = body.encode("utf-8")
             else:
                 body_bytes = body
 
@@ -1111,6 +1118,36 @@ def _setup_lib(lib):
     lib.httpcloak_clear_session_cache_callbacks.argtypes = []
     lib.httpcloak_clear_session_cache_callbacks.restype = None
 
+    # Custom preset loading
+    lib.httpcloak_preset_load_file.argtypes = [c_char_p]
+    lib.httpcloak_preset_load_file.restype = c_void_p
+    lib.httpcloak_preset_load_json.argtypes = [c_char_p]
+    lib.httpcloak_preset_load_json.restype = c_void_p
+    lib.httpcloak_preset_unregister.argtypes = [c_char_p]
+    lib.httpcloak_preset_unregister.restype = None
+    lib.httpcloak_describe_preset.argtypes = [c_char_p]
+    lib.httpcloak_describe_preset.restype = c_void_p
+
+    # Preset pool functions
+    lib.httpcloak_pool_load_file.argtypes = [c_char_p]
+    lib.httpcloak_pool_load_file.restype = c_void_p
+    lib.httpcloak_pool_load_json.argtypes = [c_char_p]
+    lib.httpcloak_pool_load_json.restype = c_void_p
+    lib.httpcloak_pool_pick.argtypes = [c_int64]
+    lib.httpcloak_pool_pick.restype = c_void_p
+    lib.httpcloak_pool_random.argtypes = [c_int64]
+    lib.httpcloak_pool_random.restype = c_void_p
+    lib.httpcloak_pool_next.argtypes = [c_int64]
+    lib.httpcloak_pool_next.restype = c_void_p
+    lib.httpcloak_pool_get.argtypes = [c_int64, c_int64]
+    lib.httpcloak_pool_get.restype = c_void_p
+    lib.httpcloak_pool_size.argtypes = [c_int64]
+    lib.httpcloak_pool_size.restype = c_int64
+    lib.httpcloak_pool_name.argtypes = [c_int64]
+    lib.httpcloak_pool_name.restype = c_void_p
+    lib.httpcloak_pool_free.argtypes = [c_int64]
+    lib.httpcloak_pool_free.restype = None
+
 
 def _ptr_to_string(ptr) -> Optional[str]:
     """Convert a C string pointer to Python string and free it."""
@@ -1403,8 +1440,12 @@ class Session:
         verify: SSL certificate verification (default: True)
         allow_redirects: Follow redirects (default: True)
         max_redirects: Maximum number of redirects to follow (default: 10)
-        retry: Number of retries on failure (default: 3, set to 0 to disable)
-        retry_on_status: List of status codes to retry on (default: [429, 500, 502, 503, 504])
+        retry: Number of retries on failure (default: 0, no retries — set to a positive
+            integer to enable. The previous default of 3 silently retried POST/PUT/PATCH
+            on 5xx, which violated request idempotency expectations and matched the bug
+            in issue #57. Aligned with the .NET binding which already defaulted to 0.)
+        retry_on_status: List of status codes to retry on (default: [429, 500, 502, 503, 504],
+            only consulted when retry > 0)
         retry_wait_min: Minimum wait time between retries in milliseconds (default: 500)
         retry_wait_max: Maximum wait time between retries in milliseconds (default: 10000)
         prefer_ipv4: Prefer IPv4 addresses over IPv6 (default: False)
@@ -1456,7 +1497,7 @@ class Session:
         verify: bool = True,
         allow_redirects: bool = True,
         max_redirects: int = 10,
-        retry: int = 3,
+        retry: int = 0,
         retry_on_status: Optional[List[int]] = None,
         retry_wait_min: int = 500,
         retry_wait_max: int = 10000,
@@ -1763,6 +1804,7 @@ class Session:
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
         timeout: Optional[int] = None,
+        fetch_mode: Optional[str] = None,
     ) -> Response:
         """
         Perform a POST request.
@@ -1842,23 +1884,32 @@ class Session:
         merged_headers = self._apply_cookies(merged_headers, cookies)
 
         if timeout:
-            return self.request("POST", url, headers=merged_headers, data=body, timeout=timeout)
+            return self.request("POST", url, headers=merged_headers, data=body, timeout=timeout, fetch_mode=fetch_mode)
 
         # Build options JSON with headers wrapper (clib expects {"headers": {...}})
         options = {}
         if merged_headers:
             options["headers"] = merged_headers
+        if fetch_mode:
+            options["fetch_mode"] = fetch_mode
         options_json = json_module.dumps(options).encode("utf-8") if options else None
 
+        body_len = len(body) if body else 0
+
         start_time = time.perf_counter()
-        result = self._lib.httpcloak_post(
+        response_handle = self._lib.httpcloak_post_raw(
             self._handle,
             url.encode("utf-8"),
             body,
+            body_len,
             options_json,
         )
         elapsed = time.perf_counter() - start_time
-        return _parse_response(result, elapsed=elapsed)
+
+        if response_handle < 0:
+            raise HTTPCloakError("Request failed")
+
+        return _parse_raw_response(self._lib, response_handle, elapsed=elapsed)
 
     def request(
         self,
@@ -1872,6 +1923,7 @@ class Session:
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
         timeout: Optional[int] = None,
+        fetch_mode: Optional[str] = None,
     ) -> Response:
         """
         Perform a custom HTTP request.
@@ -1886,34 +1938,38 @@ class Session:
             headers: Request headers
             cookies: Cookies to send with this request
             auth: Basic auth tuple (username, password)
-            timeout: Request timeout in milliseconds
+            timeout: Request timeout in seconds (matches Session(timeout=) and
+                the per-request `timeout` on get/post/put/patch/delete/head/
+                options). The clib expects milliseconds; the conversion is
+                applied below.
         """
         import json as json_module
 
         url = _add_params_to_url(url, params)
         merged_headers = self._merge_headers(headers)
 
-        body = None
+        body_bytes = None
         # Handle multipart file upload
         if files is not None:
             form_data = data if isinstance(data, dict) else None
             body_bytes, content_type = _encode_multipart(data=form_data, files=files)
-            body = body_bytes.decode("latin-1")  # Preserve binary data
             merged_headers = merged_headers or {}
             merged_headers["Content-Type"] = content_type
         elif json is not None:
-            body = json_module.dumps(json)
+            body_bytes = json_module.dumps(json).encode("utf-8")
             merged_headers = merged_headers or {}
             merged_headers.setdefault("Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
-                body = urlencode(data)
+                body_bytes = urlencode(data).encode("utf-8")
                 merged_headers = merged_headers or {}
                 merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+            elif isinstance(data, str):
+                body_bytes = data.encode("utf-8")
             elif isinstance(data, bytes):
-                body = data.decode("utf-8")
+                body_bytes = data
             else:
-                body = data
+                body_bytes = bytes(data)
 
         # Use request auth if provided, otherwise fall back to session auth
         effective_auth = auth if auth is not None else self.auth
@@ -1926,18 +1982,27 @@ class Session:
         }
         if merged_headers:
             request_config["headers"] = merged_headers
-        if body:
-            request_config["body"] = body
         if timeout:
-            request_config["timeout"] = timeout
+            # Public API: seconds. clib: milliseconds.
+            request_config["timeout"] = int(timeout * 1000)
+        if fetch_mode:
+            request_config["fetch_mode"] = fetch_mode
+
+        body_len = len(body_bytes) if body_bytes else 0
 
         start_time = time.perf_counter()
-        result = self._lib.httpcloak_request(
+        response_handle = self._lib.httpcloak_request_raw(
             self._handle,
             json_module.dumps(request_config).encode("utf-8"),
+            body_bytes,
+            body_len,
         )
         elapsed = time.perf_counter() - start_time
-        return _parse_response(result, elapsed=elapsed)
+
+        if response_handle < 0:
+            raise HTTPCloakError("Request failed")
+
+        return _parse_raw_response(self._lib, response_handle, elapsed=elapsed)
 
     def put(
         self,
@@ -1950,9 +2015,10 @@ class Session:
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
         timeout: Optional[int] = None,
+        fetch_mode: Optional[str] = None,
     ) -> Response:
         """Perform a PUT request."""
-        return self.request("PUT", url, params=params, data=data, json=json, files=files, headers=headers, cookies=cookies, auth=auth, timeout=timeout)
+        return self.request("PUT", url, params=params, data=data, json=json, files=files, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode)
 
     def delete(
         self,
@@ -1962,9 +2028,10 @@ class Session:
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
         timeout: Optional[int] = None,
+        fetch_mode: Optional[str] = None,
     ) -> Response:
         """Perform a DELETE request."""
-        return self.request("DELETE", url, params=params, headers=headers, cookies=cookies, auth=auth, timeout=timeout)
+        return self.request("DELETE", url, params=params, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode)
 
     def patch(
         self,
@@ -1977,9 +2044,10 @@ class Session:
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
         timeout: Optional[int] = None,
+        fetch_mode: Optional[str] = None,
     ) -> Response:
         """Perform a PATCH request."""
-        return self.request("PATCH", url, params=params, data=data, json=json, files=files, headers=headers, cookies=cookies, auth=auth, timeout=timeout)
+        return self.request("PATCH", url, params=params, data=data, json=json, files=files, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode)
 
     def head(
         self,
@@ -1989,9 +2057,10 @@ class Session:
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
         timeout: Optional[int] = None,
+        fetch_mode: Optional[str] = None,
     ) -> Response:
         """Perform a HEAD request."""
-        return self.request("HEAD", url, params=params, headers=headers, cookies=cookies, auth=auth, timeout=timeout)
+        return self.request("HEAD", url, params=params, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode)
 
     def options(
         self,
@@ -2001,9 +2070,10 @@ class Session:
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
         timeout: Optional[int] = None,
+        fetch_mode: Optional[str] = None,
     ) -> Response:
         """Perform an OPTIONS request."""
-        return self.request("OPTIONS", url, params=params, headers=headers, cookies=cookies, auth=auth, timeout=timeout)
+        return self.request("OPTIONS", url, params=params, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode)
 
     # =========================================================================
     # Async Methods (Native - using Go goroutines)
@@ -2016,6 +2086,7 @@ class Session:
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
+        fetch_mode: Optional[str] = None,
     ) -> Response:
         """
         Async GET request using native Go goroutines.
@@ -2044,6 +2115,8 @@ class Session:
         options = {}
         if merged_headers:
             options["headers"] = merged_headers
+        if fetch_mode:
+            options["fetch_mode"] = fetch_mode
         options_json = json.dumps(options).encode("utf-8") if options else None
 
         # Start async request
@@ -2066,6 +2139,7 @@ class Session:
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
+        fetch_mode: Optional[str] = None,
     ) -> Response:
         """
         Async POST request using native Go goroutines.
@@ -2115,6 +2189,8 @@ class Session:
         options = {}
         if merged_headers:
             options["headers"] = merged_headers
+        if fetch_mode:
+            options["fetch_mode"] = fetch_mode
         options_json = json.dumps(options).encode("utf-8") if options else None
 
         # Start async request
@@ -2139,6 +2215,7 @@ class Session:
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
+        fetch_mode: Optional[str] = None,
     ) -> Response:
         """
         Async custom HTTP request using native Go goroutines.
@@ -2191,6 +2268,8 @@ class Session:
             request_config["headers"] = merged_headers
         if body:
             request_config["body"] = body
+        if fetch_mode:
+            request_config["fetch_mode"] = fetch_mode
 
         # Get async manager and register this request (each request gets unique ID)
         manager = _get_async_manager()
@@ -2251,27 +2330,15 @@ class Session:
             ]
         return []
 
-    def get_cookies(self) -> Dict[str, str]:
+    def get_cookies(self) -> "List[Cookie]":
         """
-        Get all cookies as a flat name-value dict.
+        Get all cookies from the session with full metadata.
 
-        .. deprecated::
-            In a future release, this method will return ``List[Cookie]`` with full metadata,
-            same as :meth:`get_cookies_detailed`.
+        Returns a list of :class:`Cookie` objects (domain, path, expiry, flags).
+        For the older flat name->value dict, build it yourself:
+        ``{c.name: c.value for c in session.get_cookies()}``.
         """
-        if not getattr(Session, "_get_cookies_warned", False):
-            Session._get_cookies_warned = True
-            import warnings
-            warnings.warn(
-                "get_cookies() currently returns a flat {name: value} dict. "
-                "In a future release, it will return List[Cookie] with full metadata "
-                "(domain, path, expiry, etc.), same as get_cookies_detailed(). "
-                "Update your code accordingly.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        cookies = self.get_cookies_detailed()
-        return {c.name: c.value for c in cookies}
+        return self.get_cookies_detailed()
 
     def get_cookie_detailed(self, name: str) -> "Optional[Cookie]":
         """
@@ -2289,33 +2356,20 @@ class Session:
                 return c
         return None
 
-    def get_cookie(self, name: str) -> Optional[str]:
+    def get_cookie(self, name: str) -> "Optional[Cookie]":
         """
-        Get a specific cookie value by name.
+        Get a specific cookie by name with full metadata.
 
-        .. deprecated::
-            In a future release, this method will return ``Optional[Cookie]`` with full metadata,
-            same as :meth:`get_cookie_detailed`.
+        Returns a :class:`Cookie` object (domain, path, expiry, flags) or ``None``
+        if not found. For just the value: ``c = session.get_cookie("foo"); v = c.value if c else None``.
 
         Args:
             name: Cookie name
 
         Returns:
-            Cookie value or None if not found
+            Cookie object or None if not found
         """
-        if not getattr(Session, "_get_cookie_warned", False):
-            Session._get_cookie_warned = True
-            import warnings
-            warnings.warn(
-                "get_cookie() currently returns a string value. "
-                "In a future release, it will return a Cookie object with full metadata "
-                "(domain, path, expiry, etc.), same as get_cookie_detailed(). "
-                "Update your code accordingly.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        cookie = self.get_cookie_detailed(name)
-        return cookie.value if cookie else None
+        return self.get_cookie_detailed(name)
 
     def set_cookie(
         self,
@@ -2681,6 +2735,7 @@ class Session:
         auth: Optional[Tuple[str, str]] = None,
         timeout: Optional[int] = None,
         stream: bool = False,
+        fetch_mode: Optional[str] = None,
     ) -> Union[Response, StreamResponse]:
         """
         Perform a GET request.
@@ -2720,12 +2775,14 @@ class Session:
         merged_headers = self._apply_cookies(merged_headers, cookies)
 
         if timeout:
-            return self.request("GET", url, headers=merged_headers, timeout=timeout)
+            return self.request("GET", url, headers=merged_headers, timeout=timeout, fetch_mode=fetch_mode)
 
         # Build options JSON with headers wrapper (clib expects {"headers": {...}})
         options = {}
         if merged_headers:
             options["headers"] = merged_headers
+        if fetch_mode:
+            options["fetch_mode"] = fetch_mode
         options_json = json.dumps(options).encode("utf-8") if options else None
 
         start_time = time.perf_counter()
@@ -3509,7 +3566,7 @@ def configure(
     verify: bool = True,
     allow_redirects: bool = True,
     max_redirects: int = 10,
-    retry: int = 3,
+    retry: int = 0,
     retry_on_status: Optional[List[int]] = None,
     prefer_ipv4: bool = False,
 ) -> None:
@@ -3529,8 +3586,8 @@ def configure(
         verify: SSL certificate verification (default: True)
         allow_redirects: Follow redirects (default: True)
         max_redirects: Maximum number of redirects to follow (default: 10)
-        retry: Number of retries on failure (default: 3, set to 0 to disable)
-        retry_on_status: List of status codes to retry on (default: None)
+        retry: Number of retries on failure (default: 0, no retries)
+        retry_on_status: List of status codes to retry on (default: None — only consulted when retry > 0)
         prefer_ipv4: Prefer IPv4 addresses over IPv6 (default: False)
 
     Example:
@@ -3586,6 +3643,215 @@ def configure(
         )
         if final_headers:
             _default_session.headers.update(final_headers)
+
+
+def load_preset(path: str) -> str:
+    """Load a custom preset from a JSON file and register it.
+
+    Args:
+        path: Path to the preset JSON file.
+
+    Returns:
+        The registered preset name.
+    """
+    lib = _get_lib()
+    result_ptr = lib.httpcloak_preset_load_file(path.encode("utf-8"))
+    result = _ptr_to_string(result_ptr)
+    if result is None:
+        raise HTTPCloakError("Failed to load preset from file")
+    data = json.loads(result)
+    if "error" in data:
+        raise HTTPCloakError(data["error"])
+    return data["name"]
+
+
+def load_preset_from_json(json_data: str) -> str:
+    """Load a custom preset from a JSON string and register it.
+
+    Args:
+        json_data: JSON string defining the preset.
+
+    Returns:
+        The registered preset name.
+    """
+    lib = _get_lib()
+    result_ptr = lib.httpcloak_preset_load_json(json_data.encode("utf-8"))
+    result = _ptr_to_string(result_ptr)
+    if result is None:
+        raise HTTPCloakError("Failed to load preset from JSON")
+    data = json.loads(result)
+    if "error" in data:
+        raise HTTPCloakError(data["error"])
+    return data["name"]
+
+
+def unregister_preset(name: str) -> None:
+    """Unregister a custom preset by name.
+
+    Args:
+        name: The preset name to unregister.
+    """
+    lib = _get_lib()
+    lib.httpcloak_preset_unregister(name.encode("utf-8"))
+
+
+def describe_preset(name: str) -> str:
+    """Return a fully-resolved JSON document for the given preset.
+
+    The output is a complete preset definition flattened from any
+    inheritance chains and resolved against Chrome defaults — suitable
+    for saving, editing, and reloading via ``load_preset_from_json``.
+    Two consecutive calls on the same preset return byte-identical JSON.
+
+    Args:
+        name: The preset name (e.g. ``"chrome-146-windows"``). Both
+            built-in names and custom-registered names are accepted.
+
+    Returns:
+        A JSON string in the standard ``PresetFile`` format
+        (``{"version": 1, "preset": {...}}``).
+
+    Raises:
+        HTTPCloakError: If the preset is not registered or if it
+            references an unknown utls ClientHelloID.
+    """
+    lib = _get_lib()
+    result_ptr = lib.httpcloak_describe_preset(name.encode("utf-8"))
+    result = _ptr_to_string(result_ptr)
+    if result is None:
+        raise HTTPCloakError(f"Failed to describe preset: {name}")
+    # Detect the {"error": "..."} envelope returned by makeErrorJSON in clib.
+    try:
+        decoded = json.loads(result)
+    except json.JSONDecodeError as exc:
+        raise HTTPCloakError(f"Invalid describe_preset response: {exc}") from exc
+    if isinstance(decoded, dict) and "error" in decoded and "preset" not in decoded:
+        raise HTTPCloakError(decoded["error"])
+    return result
+
+
+class PresetPool:
+    """A pool of custom fingerprint presets for rotation.
+
+    Pools load multiple presets from a single JSON file and provide
+    round-robin or random selection. All presets are auto-registered
+    on construction, so you can pass the returned name directly to
+    ``Session(preset=name)``.
+
+    Example::
+
+        pool = PresetPool("presets/rotation_pool.json")
+        print(len(pool))       # number of presets
+        print(pool.next())     # round-robin preset name
+
+        session = Session(preset=pool.random())
+        session.close()
+        pool.close()
+
+    Supports context manager and ``len()``/``pool[i]`` indexing.
+    """
+
+    def __init__(self, path: str):
+        self._lib = _get_lib()
+        result_ptr = self._lib.httpcloak_pool_load_file(path.encode("utf-8"))
+        result = _ptr_to_string(result_ptr)
+        if result is None:
+            raise HTTPCloakError(f"Failed to load preset pool from file: {path}")
+        data = json.loads(result)
+        if "error" in data:
+            raise HTTPCloakError(data["error"])
+        self._handle = data["handle"]
+
+    @classmethod
+    def from_json(cls, json_data: str) -> "PresetPool":
+        """Load a preset pool from a JSON string."""
+        pool = object.__new__(cls)
+        pool._lib = _get_lib()
+        result_ptr = pool._lib.httpcloak_pool_load_json(json_data.encode("utf-8"))
+        result = _ptr_to_string(result_ptr)
+        if result is None:
+            raise HTTPCloakError("Failed to load preset pool from JSON")
+        data = json.loads(result)
+        if "error" in data:
+            raise HTTPCloakError(data["error"])
+        pool._handle = data["handle"]
+        return pool
+
+    def _parse_pool_result(self, ptr) -> str:
+        result = _ptr_to_string(ptr)
+        if result is None:
+            raise HTTPCloakError("No result from preset pool")
+        # Error responses are JSON: {"error":"..."}
+        if result.startswith("{"):
+            data = json.loads(result)
+            if "error" in data:
+                raise HTTPCloakError(data["error"])
+        return result
+
+    def _check_handle(self):
+        if not self._handle or self._handle <= 0:
+            raise HTTPCloakError("PresetPool is closed")
+
+    def pick(self) -> str:
+        """Pick a preset using the pool's configured strategy."""
+        self._check_handle()
+        return self._parse_pool_result(self._lib.httpcloak_pool_pick(self._handle))
+
+    def random(self) -> str:
+        """Pick a random preset from the pool."""
+        self._check_handle()
+        return self._parse_pool_result(self._lib.httpcloak_pool_random(self._handle))
+
+    def next(self) -> str:
+        """Pick the next preset in round-robin order."""
+        self._check_handle()
+        return self._parse_pool_result(self._lib.httpcloak_pool_next(self._handle))
+
+    def get(self, index: int) -> str:
+        """Get a preset by index."""
+        self._check_handle()
+        return self._parse_pool_result(self._lib.httpcloak_pool_get(self._handle, index))
+
+    @property
+    def size(self) -> int:
+        """Number of presets in the pool."""
+        self._check_handle()
+        s = self._lib.httpcloak_pool_size(self._handle)
+        if s < 0:
+            raise HTTPCloakError("Failed to get pool size")
+        return s
+
+    @property
+    def name(self) -> str:
+        """Name of the preset pool."""
+        self._check_handle()
+        return self._parse_pool_result(self._lib.httpcloak_pool_name(self._handle))
+
+    def close(self):
+        """Free the pool handle and unregister all its presets."""
+        if self._handle and self._handle > 0:
+            self._lib.httpcloak_pool_free(self._handle)
+            self._handle = 0
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, index: int) -> str:
+        if index < 0:
+            index = len(self) + index
+        return self.get(index)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
 class LocalProxy:

@@ -216,11 +216,28 @@ class Response {
    * @param {Object} data - Response data from native library
    * @param {number} [elapsed=0] - Elapsed time in milliseconds
    */
-  constructor(data, elapsed = 0) {
+  constructor(data, elapsed = 0, rawBody = null) {
     this.statusCode = data.status_code || 0;
     this.headers = data.headers || {};
-    this._body = Buffer.from(data.body || "", "utf8");
-    this._text = data.body || "";
+    if (rawBody !== null) {
+      // Raw-path: body arrived as binary bytes alongside metadata JSON
+      // (httpcloak_*_raw + response_finalize). No base64 round trip — fastest
+      // and loss-free for PDFs/images/etc.
+      this._body = rawBody;
+      this._text = rawBody.toString("utf8"); // best-effort text view
+    } else {
+      // JSON path: body is a string inside the JSON blob. Non-UTF-8 bodies
+      // arrive base64-encoded (Go side since 98e4228). Valid UTF-8 passes
+      // through as plain text.
+      const bodyStr = data.body || "";
+      if (data.body_encoding === "base64") {
+        this._body = Buffer.from(bodyStr, "base64");
+        this._text = this._body.toString("utf8");
+      } else {
+        this._body = Buffer.from(bodyStr, "utf8");
+        this._text = bodyStr;
+      }
+    }
     this.finalUrl = data.final_url || "";
     this.protocol = data.protocol || "";
     this.elapsed = elapsed; // milliseconds
@@ -787,27 +804,37 @@ function getLib() {
     const libPath = getLibPath();
     nativeLibHandle = koffi.load(libPath);
 
-    // Use str for string returns - koffi handles the string copy automatically
-    // Note: The C strings allocated by Go are not freed, but Go's GC handles them
+    // Declare the free function first so we can hand it to koffi.disposable.
+    // httpcloak_free_string is NULL-safe on the Go side (no-op on nil).
+    const httpcloakFreeString = nativeLibHandle.func("httpcloak_free_string", "void", ["void*"]);
+
+    // Named disposable type derived from "str": koffi decodes the C string
+    // into a JS string AND then calls httpcloakFreeString on the original
+    // malloc'd pointer. Every function below that returned plain "str"
+    // previously leaked that malloc (issue #48: customers reported ~48MB/h
+    // RSS growth in sustained production traffic). Using HeapStr closes the
+    // leak without any call-site changes.
+    const HeapStr = koffi.disposable("HeapStr", "str", httpcloakFreeString);
+
     lib = {
       httpcloak_session_new: nativeLibHandle.func("httpcloak_session_new", "int64", ["str"]),
       httpcloak_session_free: nativeLibHandle.func("httpcloak_session_free", "void", ["int64"]),
       httpcloak_session_refresh: nativeLibHandle.func("httpcloak_session_refresh", "void", ["int64"]),
-      httpcloak_session_refresh_protocol: nativeLibHandle.func("httpcloak_session_refresh_protocol", "str", ["int64", "str"]),
-      httpcloak_session_warmup: nativeLibHandle.func("httpcloak_session_warmup", "str", ["int64", "str", "int64"]),
+      httpcloak_session_refresh_protocol: nativeLibHandle.func("httpcloak_session_refresh_protocol", HeapStr, ["int64", "str"]),
+      httpcloak_session_warmup: nativeLibHandle.func("httpcloak_session_warmup", HeapStr, ["int64", "str", "int64"]),
       httpcloak_session_fork: nativeLibHandle.func("httpcloak_session_fork", "int64", ["int64"]),
-      httpcloak_get: nativeLibHandle.func("httpcloak_get", "str", ["int64", "str", "str"]),
-      httpcloak_post: nativeLibHandle.func("httpcloak_post", "str", ["int64", "str", "str", "str"]),
-      httpcloak_request: nativeLibHandle.func("httpcloak_request", "str", ["int64", "str"]),
-      httpcloak_get_cookies: nativeLibHandle.func("httpcloak_get_cookies", "str", ["int64"]),
+      httpcloak_get: nativeLibHandle.func("httpcloak_get", HeapStr, ["int64", "str", "str"]),
+      httpcloak_post: nativeLibHandle.func("httpcloak_post", HeapStr, ["int64", "str", "str", "str"]),
+      httpcloak_request: nativeLibHandle.func("httpcloak_request", HeapStr, ["int64", "str"]),
+      httpcloak_get_cookies: nativeLibHandle.func("httpcloak_get_cookies", HeapStr, ["int64"]),
       httpcloak_set_cookie: nativeLibHandle.func("httpcloak_set_cookie", "void", ["int64", "str"]),
       httpcloak_delete_cookie: nativeLibHandle.func("httpcloak_delete_cookie", "void", ["int64", "str", "str"]),
       httpcloak_clear_cookies: nativeLibHandle.func("httpcloak_clear_cookies", "void", ["int64"]),
-      httpcloak_free_string: nativeLibHandle.func("httpcloak_free_string", "void", ["void*"]),
-      httpcloak_version: nativeLibHandle.func("httpcloak_version", "str", []),
-      httpcloak_available_presets: nativeLibHandle.func("httpcloak_available_presets", "str", []),
-      httpcloak_set_ech_dns_servers: nativeLibHandle.func("httpcloak_set_ech_dns_servers", "str", ["str"]),
-      httpcloak_get_ech_dns_servers: nativeLibHandle.func("httpcloak_get_ech_dns_servers", "str", []),
+      httpcloak_free_string: httpcloakFreeString,
+      httpcloak_version: nativeLibHandle.func("httpcloak_version", HeapStr, []),
+      httpcloak_available_presets: nativeLibHandle.func("httpcloak_available_presets", HeapStr, []),
+      httpcloak_set_ech_dns_servers: nativeLibHandle.func("httpcloak_set_ech_dns_servers", HeapStr, ["str"]),
+      httpcloak_get_ech_dns_servers: nativeLibHandle.func("httpcloak_get_ech_dns_servers", HeapStr, []),
       // Async functions
       httpcloak_register_callback: nativeLibHandle.func("httpcloak_register_callback", "int64", [koffi.pointer(AsyncCallbackProto)]),
       httpcloak_unregister_callback: nativeLibHandle.func("httpcloak_unregister_callback", "void", ["int64"]),
@@ -818,41 +845,41 @@ function getLib() {
       httpcloak_stream_get: nativeLibHandle.func("httpcloak_stream_get", "int64", ["int64", "str", "str"]),
       httpcloak_stream_post: nativeLibHandle.func("httpcloak_stream_post", "int64", ["int64", "str", "str", "str"]),
       httpcloak_stream_request: nativeLibHandle.func("httpcloak_stream_request", "int64", ["int64", "str"]),
-      httpcloak_stream_get_metadata: nativeLibHandle.func("httpcloak_stream_get_metadata", "str", ["int64"]),
-      httpcloak_stream_read: nativeLibHandle.func("httpcloak_stream_read", "str", ["int64", "int64"]),
+      httpcloak_stream_get_metadata: nativeLibHandle.func("httpcloak_stream_get_metadata", HeapStr, ["int64"]),
+      httpcloak_stream_read: nativeLibHandle.func("httpcloak_stream_read", HeapStr, ["int64", "int64"]),
       httpcloak_stream_close: nativeLibHandle.func("httpcloak_stream_close", "void", ["int64"]),
       // Raw response functions for fast-path (zero-copy)
       httpcloak_get_raw: nativeLibHandle.func("httpcloak_get_raw", "int64", ["int64", "str", "str"]),
       httpcloak_post_raw: nativeLibHandle.func("httpcloak_post_raw", "int64", ["int64", "str", "void*", "int", "str"]),
       httpcloak_request_raw: nativeLibHandle.func("httpcloak_request_raw", "int64", ["int64", "str", "void*", "int"]),
-      httpcloak_response_get_metadata: nativeLibHandle.func("httpcloak_response_get_metadata", "str", ["int64"]),
+      httpcloak_response_get_metadata: nativeLibHandle.func("httpcloak_response_get_metadata", HeapStr, ["int64"]),
       httpcloak_response_get_body_len: nativeLibHandle.func("httpcloak_response_get_body_len", "int", ["int64"]),
       httpcloak_response_copy_body_to: nativeLibHandle.func("httpcloak_response_copy_body_to", "int", ["int64", "void*", "int"]),
       httpcloak_response_free: nativeLibHandle.func("httpcloak_response_free", "void", ["int64"]),
       // Combined finalize function (copy + metadata + free in one call)
-      httpcloak_response_finalize: nativeLibHandle.func("httpcloak_response_finalize", "str", ["int64", "void*", "int"]),
+      httpcloak_response_finalize: nativeLibHandle.func("httpcloak_response_finalize", HeapStr, ["int64", "void*", "int"]),
       // Session persistence functions
-      httpcloak_session_save: nativeLibHandle.func("httpcloak_session_save", "str", ["int64", "str"]),
+      httpcloak_session_save: nativeLibHandle.func("httpcloak_session_save", HeapStr, ["int64", "str"]),
       httpcloak_session_load: nativeLibHandle.func("httpcloak_session_load", "int64", ["str"]),
-      httpcloak_session_marshal: nativeLibHandle.func("httpcloak_session_marshal", "str", ["int64"]),
+      httpcloak_session_marshal: nativeLibHandle.func("httpcloak_session_marshal", HeapStr, ["int64"]),
       httpcloak_session_unmarshal: nativeLibHandle.func("httpcloak_session_unmarshal", "int64", ["str"]),
       // Proxy management functions
-      httpcloak_session_set_proxy: nativeLibHandle.func("httpcloak_session_set_proxy", "str", ["int64", "str"]),
-      httpcloak_session_set_tcp_proxy: nativeLibHandle.func("httpcloak_session_set_tcp_proxy", "str", ["int64", "str"]),
-      httpcloak_session_set_udp_proxy: nativeLibHandle.func("httpcloak_session_set_udp_proxy", "str", ["int64", "str"]),
-      httpcloak_session_get_proxy: nativeLibHandle.func("httpcloak_session_get_proxy", "str", ["int64"]),
-      httpcloak_session_get_tcp_proxy: nativeLibHandle.func("httpcloak_session_get_tcp_proxy", "str", ["int64"]),
-      httpcloak_session_get_udp_proxy: nativeLibHandle.func("httpcloak_session_get_udp_proxy", "str", ["int64"]),
+      httpcloak_session_set_proxy: nativeLibHandle.func("httpcloak_session_set_proxy", HeapStr, ["int64", "str"]),
+      httpcloak_session_set_tcp_proxy: nativeLibHandle.func("httpcloak_session_set_tcp_proxy", HeapStr, ["int64", "str"]),
+      httpcloak_session_set_udp_proxy: nativeLibHandle.func("httpcloak_session_set_udp_proxy", HeapStr, ["int64", "str"]),
+      httpcloak_session_get_proxy: nativeLibHandle.func("httpcloak_session_get_proxy", HeapStr, ["int64"]),
+      httpcloak_session_get_tcp_proxy: nativeLibHandle.func("httpcloak_session_get_tcp_proxy", HeapStr, ["int64"]),
+      httpcloak_session_get_udp_proxy: nativeLibHandle.func("httpcloak_session_get_udp_proxy", HeapStr, ["int64"]),
       // Header order customization
-      httpcloak_session_set_header_order: nativeLibHandle.func("httpcloak_session_set_header_order", "str", ["int64", "str"]),
-      httpcloak_session_get_header_order: nativeLibHandle.func("httpcloak_session_get_header_order", "str", ["int64"]),
+      httpcloak_session_set_header_order: nativeLibHandle.func("httpcloak_session_set_header_order", HeapStr, ["int64", "str"]),
+      httpcloak_session_get_header_order: nativeLibHandle.func("httpcloak_session_get_header_order", HeapStr, ["int64"]),
       // Local proxy functions
       httpcloak_local_proxy_start: nativeLibHandle.func("httpcloak_local_proxy_start", "int64", ["str"]),
       httpcloak_local_proxy_stop: nativeLibHandle.func("httpcloak_local_proxy_stop", "void", ["int64"]),
       httpcloak_local_proxy_get_port: nativeLibHandle.func("httpcloak_local_proxy_get_port", "int", ["int64"]),
       httpcloak_local_proxy_is_running: nativeLibHandle.func("httpcloak_local_proxy_is_running", "int", ["int64"]),
-      httpcloak_local_proxy_get_stats: nativeLibHandle.func("httpcloak_local_proxy_get_stats", "str", ["int64"]),
-      httpcloak_local_proxy_register_session: nativeLibHandle.func("httpcloak_local_proxy_register_session", "str", ["int64", "str", "int64"]),
+      httpcloak_local_proxy_get_stats: nativeLibHandle.func("httpcloak_local_proxy_get_stats", HeapStr, ["int64"]),
+      httpcloak_local_proxy_register_session: nativeLibHandle.func("httpcloak_local_proxy_register_session", HeapStr, ["int64", "str", "int64"]),
       httpcloak_local_proxy_unregister_session: nativeLibHandle.func("httpcloak_local_proxy_unregister_session", "int", ["int64", "str"]),
       // Session cache callbacks
       httpcloak_set_session_cache_callbacks: nativeLibHandle.func("httpcloak_set_session_cache_callbacks", "void", [
@@ -876,6 +903,23 @@ function getLib() {
       // Async cache result functions (called by JS to provide results to Go)
       httpcloak_async_cache_get_result: nativeLibHandle.func("httpcloak_async_cache_get_result", "void", ["int64", "str"]),
       httpcloak_async_cache_op_result: nativeLibHandle.func("httpcloak_async_cache_op_result", "void", ["int64", "int"]),
+      // Custom preset loading (void* returns for manual free)
+      httpcloak_preset_load_file: nativeLibHandle.func("httpcloak_preset_load_file", "void*", ["str"]),
+      httpcloak_preset_load_json: nativeLibHandle.func("httpcloak_preset_load_json", "void*", ["str"]),
+      httpcloak_preset_unregister: nativeLibHandle.func("httpcloak_preset_unregister", "void", ["str"]),
+      // Describe uses HeapStr (issue #48 leak-safe disposable) — koffi
+      // auto-frees the malloc'd C string after decode.
+      httpcloak_describe_preset: nativeLibHandle.func("httpcloak_describe_preset", HeapStr, ["str"]),
+      // Preset pool functions (void* returns for manual free)
+      httpcloak_pool_load_file: nativeLibHandle.func("httpcloak_pool_load_file", "void*", ["str"]),
+      httpcloak_pool_load_json: nativeLibHandle.func("httpcloak_pool_load_json", "void*", ["str"]),
+      httpcloak_pool_pick: nativeLibHandle.func("httpcloak_pool_pick", "void*", ["int64"]),
+      httpcloak_pool_random: nativeLibHandle.func("httpcloak_pool_random", "void*", ["int64"]),
+      httpcloak_pool_next: nativeLibHandle.func("httpcloak_pool_next", "void*", ["int64"]),
+      httpcloak_pool_get: nativeLibHandle.func("httpcloak_pool_get", "void*", ["int64", "int64"]),
+      httpcloak_pool_size: nativeLibHandle.func("httpcloak_pool_size", "int64", ["int64"]),
+      httpcloak_pool_name: nativeLibHandle.func("httpcloak_pool_name", "void*", ["int64"]),
+      httpcloak_pool_free: nativeLibHandle.func("httpcloak_pool_free", "void", ["int64"]),
     };
   }
   return lib;
@@ -1027,6 +1071,38 @@ function parseResponse(resultPtr, elapsed = 0) {
   }
 
   return new Response(data, elapsed);
+}
+
+/**
+ * Parse a raw response handle returned by httpcloak_*_raw into a Response
+ * with a binary Buffer body. Avoids the base64 round trip used by the JSON
+ * path — binary bodies (PDFs, images, streams) land in memory once.
+ * @param {Object} lib - Native library binding
+ * @param {number|bigint} responseHandle
+ * @param {number} [elapsed=0] - Elapsed milliseconds
+ * @returns {Response}
+ */
+function parseRawResponse(lib, responseHandle, elapsed = 0) {
+  const bodyLen = lib.httpcloak_response_get_body_len(responseHandle);
+  if (bodyLen < 0) {
+    lib.httpcloak_response_free(responseHandle);
+    throw new HTTPCloakError("Failed to get response body length");
+  }
+
+  const buffer = Buffer.allocUnsafe(bodyLen);
+  // finalize() copies body into buffer, returns metadata JSON (no body), and
+  // frees the handle — a single FFI call instead of three.
+  const metadataStr = lib.httpcloak_response_finalize(responseHandle, buffer, bodyLen);
+  if (!metadataStr) {
+    throw new HTTPCloakError("Failed to finalize response");
+  }
+
+  const metadata = JSON.parse(metadataStr);
+  if (metadata.error) {
+    throw new HTTPCloakError(metadata.error);
+  }
+
+  return new Response(metadata, elapsed, buffer);
 }
 
 /**
@@ -1250,8 +1326,8 @@ class Session {
    * @param {boolean} [options.verify=true] - SSL certificate verification
    * @param {boolean} [options.allowRedirects=true] - Follow redirects
    * @param {number} [options.maxRedirects=10] - Maximum number of redirects to follow
-   * @param {number} [options.retry=3] - Number of retries on failure (set to 0 to disable)
-   * @param {number[]} [options.retryOnStatus] - Status codes to retry on
+   * @param {number} [options.retry=0] - Number of retries on failure (default 0 = no retries; set positive to enable. Issue #57: prior default 3 silently retried POST/PUT/PATCH on 5xx, violating idempotency expectations)
+   * @param {number[]} [options.retryOnStatus] - Status codes to retry on (only consulted when retry > 0)
    * @param {number} [options.retryWaitMin=500] - Minimum wait time between retries in milliseconds
    * @param {number} [options.retryWaitMax=10000] - Maximum wait time between retries in milliseconds
    * @param {Array} [options.auth] - Default auth [username, password] for all requests
@@ -1271,7 +1347,7 @@ class Session {
       verify = true,
       allowRedirects = true,
       maxRedirects = 10,
-      retry = 3,
+      retry = 0,
       retryOnStatus = null,
       retryWaitMin = 500,
       retryWaitMax = 10000,
@@ -1526,7 +1602,7 @@ class Session {
    * @returns {Response} Response object
    */
   getSync(url, options = {}) {
-    const { headers = null, params = null, cookies = null, auth = null } = options;
+    const { headers = null, params = null, cookies = null, auth = null, fetchMode = null } = options;
 
     url = addParamsToUrl(url, params);
     let mergedHeaders = this._mergeHeaders(headers);
@@ -1540,12 +1616,18 @@ class Session {
     if (mergedHeaders) {
       reqOptions.headers = mergedHeaders;
     }
+    if (fetchMode) {
+      reqOptions.fetch_mode = fetchMode;
+    }
     const optionsJson = Object.keys(reqOptions).length > 0 ? JSON.stringify(reqOptions) : null;
 
     const startTime = Date.now();
-    const result = this._lib.httpcloak_get(this._handle, url, optionsJson);
+    const responseHandle = this._lib.httpcloak_get_raw(this._handle, url, optionsJson);
     const elapsed = Date.now() - startTime;
-    return parseResponse(result, elapsed);
+    if (responseHandle < 0 || responseHandle === 0 || responseHandle === 0n) {
+      throw new HTTPCloakError("Request failed");
+    }
+    return parseRawResponse(this._lib, responseHandle, elapsed);
   }
 
   /**
@@ -1566,38 +1648,36 @@ class Session {
    * @returns {Response} Response object
    */
   postSync(url, options = {}) {
-    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null } = options;
+    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, fetchMode = null } = options;
 
     url = addParamsToUrl(url, params);
     let mergedHeaders = this._mergeHeaders(headers);
 
-    // Handle multipart file upload
+    // Normalize body to a Buffer so the raw path can pass (ptr, len) without
+    // null-terminator truncation or utf8 mangling.
+    let bodyBuffer = null;
     if (files !== null) {
       const formData = (data !== null && typeof data === "object") ? data : null;
       const multipart = encodeMultipart(formData, files);
-      body = multipart.body.toString("latin1"); // Preserve binary data
+      bodyBuffer = multipart.body;
       mergedHeaders = mergedHeaders || {};
       mergedHeaders["Content-Type"] = multipart.contentType;
-    }
-    // Handle JSON body
-    else if (json !== null) {
-      body = JSON.stringify(json);
+    } else if (json !== null) {
+      bodyBuffer = Buffer.from(JSON.stringify(json), "utf8");
       mergedHeaders = mergedHeaders || {};
       if (!mergedHeaders["Content-Type"]) {
         mergedHeaders["Content-Type"] = "application/json";
       }
-    }
-    // Handle form data
-    else if (data !== null && typeof data === "object") {
-      body = new URLSearchParams(data).toString();
+    } else if (data !== null && typeof data === "object") {
+      bodyBuffer = Buffer.from(new URLSearchParams(data).toString(), "utf8");
       mergedHeaders = mergedHeaders || {};
       if (!mergedHeaders["Content-Type"]) {
         mergedHeaders["Content-Type"] = "application/x-www-form-urlencoded";
       }
-    }
-    // Handle Buffer body
-    else if (Buffer.isBuffer(body)) {
-      body = body.toString("utf8");
+    } else if (Buffer.isBuffer(body)) {
+      bodyBuffer = body;
+    } else if (typeof body === "string") {
+      bodyBuffer = Buffer.from(body, "utf8");
     }
 
     // Use request auth if provided, otherwise fall back to session auth
@@ -1610,12 +1690,21 @@ class Session {
     if (mergedHeaders) {
       reqOptions.headers = mergedHeaders;
     }
+    if (fetchMode) {
+      reqOptions.fetch_mode = fetchMode;
+    }
     const optionsJson = Object.keys(reqOptions).length > 0 ? JSON.stringify(reqOptions) : null;
 
+    const bodyPtr = bodyBuffer || Buffer.alloc(0);
+    const bodyLen = bodyBuffer ? bodyBuffer.length : 0;
+
     const startTime = Date.now();
-    const result = this._lib.httpcloak_post(this._handle, url, body, optionsJson);
+    const responseHandle = this._lib.httpcloak_post_raw(this._handle, url, bodyPtr, bodyLen, optionsJson);
     const elapsed = Date.now() - startTime;
-    return parseResponse(result, elapsed);
+    if (responseHandle < 0 || responseHandle === 0 || responseHandle === 0n) {
+      throw new HTTPCloakError("Request failed");
+    }
+    return parseRawResponse(this._lib, responseHandle, elapsed);
   }
 
   /**
@@ -1628,38 +1717,35 @@ class Session {
    * @returns {Response} Response object
    */
   requestSync(method, url, options = {}) {
-    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, timeout = null } = options;
+    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, timeout = null, fetchMode = null } = options;
 
     url = addParamsToUrl(url, params);
     let mergedHeaders = this._mergeHeaders(headers);
 
-    // Handle multipart file upload
+    // Normalize body to a Buffer so the raw path can pass (ptr, len).
+    let bodyBuffer = null;
     if (files !== null) {
       const formData = (data !== null && typeof data === "object") ? data : null;
       const multipart = encodeMultipart(formData, files);
-      body = multipart.body.toString("latin1"); // Preserve binary data
+      bodyBuffer = multipart.body;
       mergedHeaders = mergedHeaders || {};
       mergedHeaders["Content-Type"] = multipart.contentType;
-    }
-    // Handle JSON body
-    else if (json !== null) {
-      body = JSON.stringify(json);
+    } else if (json !== null) {
+      bodyBuffer = Buffer.from(JSON.stringify(json), "utf8");
       mergedHeaders = mergedHeaders || {};
       if (!mergedHeaders["Content-Type"]) {
         mergedHeaders["Content-Type"] = "application/json";
       }
-    }
-    // Handle form data
-    else if (data !== null && typeof data === "object") {
-      body = new URLSearchParams(data).toString();
+    } else if (data !== null && typeof data === "object") {
+      bodyBuffer = Buffer.from(new URLSearchParams(data).toString(), "utf8");
       mergedHeaders = mergedHeaders || {};
       if (!mergedHeaders["Content-Type"]) {
         mergedHeaders["Content-Type"] = "application/x-www-form-urlencoded";
       }
-    }
-    // Handle Buffer body
-    else if (Buffer.isBuffer(body)) {
-      body = body.toString("utf8");
+    } else if (Buffer.isBuffer(body)) {
+      bodyBuffer = body;
+    } else if (typeof body === "string") {
+      bodyBuffer = Buffer.from(body, "utf8");
     }
 
     // Use request auth if provided, otherwise fall back to session auth
@@ -1672,16 +1758,24 @@ class Session {
       url,
     };
     if (mergedHeaders) requestConfig.headers = mergedHeaders;
-    if (body) requestConfig.body = body;
     if (timeout) requestConfig.timeout = timeout;
+    if (fetchMode) requestConfig.fetch_mode = fetchMode;
+
+    const bodyPtr = bodyBuffer || Buffer.alloc(0);
+    const bodyLen = bodyBuffer ? bodyBuffer.length : 0;
 
     const startTime = Date.now();
-    const result = this._lib.httpcloak_request(
+    const responseHandle = this._lib.httpcloak_request_raw(
       this._handle,
-      JSON.stringify(requestConfig)
+      JSON.stringify(requestConfig),
+      bodyPtr,
+      bodyLen
     );
     const elapsed = Date.now() - startTime;
-    return parseResponse(result, elapsed);
+    if (responseHandle < 0 || responseHandle === 0 || responseHandle === 0n) {
+      throw new HTTPCloakError("Request failed");
+    }
+    return parseRawResponse(this._lib, responseHandle, elapsed);
   }
 
   // ===========================================================================
@@ -1696,7 +1790,7 @@ class Session {
    * @returns {Promise<Response>} Response object
    */
   get(url, options = {}) {
-    const { headers = null, params = null, cookies = null, auth = null } = options;
+    const { headers = null, params = null, cookies = null, auth = null, fetchMode = null, timeout = null } = options;
 
     url = addParamsToUrl(url, params);
     let mergedHeaders = this._mergeHeaders(headers);
@@ -1709,6 +1803,15 @@ class Session {
     const reqOptions = {};
     if (mergedHeaders) {
       reqOptions.headers = mergedHeaders;
+    }
+    if (fetchMode) {
+      reqOptions.fetch_mode = fetchMode;
+    }
+    if (timeout) {
+      // Public API: seconds (matches Session({ timeout }) and the
+      // existing request()/put()/delete()/etc. methods which forward to
+      // httpcloak_request_async — that path also uses time.Second).
+      reqOptions.timeout = timeout;
     }
     const optionsJson = Object.keys(reqOptions).length > 0 ? JSON.stringify(reqOptions) : null;
 
@@ -1730,7 +1833,7 @@ class Session {
    * @returns {Promise<Response>} Response object
    */
   post(url, options = {}) {
-    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null } = options;
+    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, fetchMode = null, timeout = null } = options;
 
     url = addParamsToUrl(url, params);
     let mergedHeaders = this._mergeHeaders(headers);
@@ -1773,6 +1876,13 @@ class Session {
     const reqOptions = {};
     if (mergedHeaders) {
       reqOptions.headers = mergedHeaders;
+    }
+    if (fetchMode) {
+      reqOptions.fetch_mode = fetchMode;
+    }
+    if (timeout) {
+      // Public API: seconds. clib post_async path enforces in seconds.
+      reqOptions.timeout = timeout;
     }
     const optionsJson = Object.keys(reqOptions).length > 0 ? JSON.stringify(reqOptions) : null;
 
@@ -1795,7 +1905,7 @@ class Session {
    * @returns {Promise<Response>} Response object
    */
   request(method, url, options = {}) {
-    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, timeout = null } = options;
+    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, timeout = null, fetchMode = null } = options;
 
     url = addParamsToUrl(url, params);
     let mergedHeaders = this._mergeHeaders(headers);
@@ -1841,6 +1951,7 @@ class Session {
     if (mergedHeaders) requestConfig.headers = mergedHeaders;
     if (body) requestConfig.body = body;
     if (timeout) requestConfig.timeout = timeout;
+    if (fetchMode) requestConfig.fetch_mode = fetchMode;
 
     // Register async request with callback manager
     const manager = getAsyncManager();
@@ -1906,25 +2017,15 @@ class Session {
   }
 
   /**
-   * Get all cookies as a flat name-value object.
-   * @deprecated getCookies() will return Cookie[] with full metadata (domain, path, expiry) in a future release.
-   *             Use getCookiesDetailed() if you want the new format now.
-   * @returns {Object} Cookies as key-value pairs
+   * Get all cookies from the session with full metadata.
+   *
+   * Returns Cookie[] with domain/path/expiry/flags. For the older flat
+   * name->value object, build it yourself:
+   * `Object.fromEntries(session.getCookies().map(c => [c.name, c.value]))`.
+   * @returns {Cookie[]}
    */
   getCookies() {
-    if (!Session._getCookiesDeprecated) {
-      Session._getCookiesDeprecated = true;
-      process.emitWarning(
-        'getCookies() currently returns a flat {name: value} object. In a future release, it will return Cookie[] with full metadata (domain, path, expiry, etc.), same as getCookiesDetailed(). Update your code accordingly.',
-        'DeprecationWarning'
-      );
-    }
-    const cookies = this.getCookiesDetailed();
-    const result = {};
-    for (const c of cookies) {
-      result[c.name] = c.value;
-    }
-    return result;
+    return this.getCookiesDetailed();
   }
 
   /**
@@ -1938,22 +2039,15 @@ class Session {
   }
 
   /**
-   * Get a specific cookie value by name.
-   * @deprecated getCookie() will return a Cookie object (with domain, path, expiry) instead of a string in a future release.
-   *             Use getCookieDetailed() if you want the new format now.
+   * Get a specific cookie by name.
+   *
+   * Returns a Cookie object (with domain/path/expiry/flags) or null. For just
+   * the string value: `const c = session.getCookie('foo'); const v = c?.value`.
    * @param {string} name - Cookie name
-   * @returns {string|null} Cookie value or null if not found
+   * @returns {Cookie|null}
    */
   getCookie(name) {
-    if (!Session._getCookieDeprecated) {
-      Session._getCookieDeprecated = true;
-      process.emitWarning(
-        'getCookie() currently returns a string value. In a future release, it will return a Cookie object with full metadata (domain, path, expiry, etc.), same as getCookieDetailed(). Update your code accordingly.',
-        'DeprecationWarning'
-      );
-    }
-    const cookie = this.getCookieDetailed(name);
-    return cookie ? cookie.value : null;
+    return this.getCookieDetailed(name);
   }
 
   /**
@@ -2821,8 +2915,8 @@ let _defaultConfig = {};
  * @param {boolean} [options.verify=true] - SSL certificate verification
  * @param {boolean} [options.allowRedirects=true] - Follow redirects
  * @param {number} [options.maxRedirects=10] - Maximum number of redirects to follow
- * @param {number} [options.retry=3] - Number of retries on failure (set to 0 to disable)
- * @param {number[]} [options.retryOnStatus] - Status codes to retry on
+ * @param {number} [options.retry=0] - Number of retries on failure (default 0 = no retries; set positive to enable. See issue #57)
+ * @param {number[]} [options.retryOnStatus] - Status codes to retry on (only consulted when retry > 0)
  */
 function configure(options = {}) {
   const {
@@ -2835,7 +2929,7 @@ function configure(options = {}) {
     verify = true,
     allowRedirects = true,
     maxRedirects = 10,
-    retry = 3,
+    retry = 0,
     retryOnStatus = null,
   } = options;
 
@@ -2891,7 +2985,7 @@ function _getDefaultSession() {
     const verify = _defaultConfig.verify !== undefined ? _defaultConfig.verify : true;
     const allowRedirects = _defaultConfig.allowRedirects !== undefined ? _defaultConfig.allowRedirects : true;
     const maxRedirects = _defaultConfig.maxRedirects || 10;
-    const retry = _defaultConfig.retry !== undefined ? _defaultConfig.retry : 3;
+    const retry = _defaultConfig.retry !== undefined ? _defaultConfig.retry : 0;
     const retryOnStatus = _defaultConfig.retryOnStatus || null;
     const headers = _defaultConfig.headers || {};
 
@@ -3538,10 +3632,247 @@ function clearSessionCache() {
 }
 
 
+// --- String Memory Management for Preset/Pool Functions ---
+
+/**
+ * Read a C string from a void pointer and free the native memory.
+ * Returns null if the pointer is null/0.
+ * @param {*} ptr - Native void pointer
+ * @returns {string|null}
+ */
+function readAndFreeString(ptr) {
+  if (!ptr) return null;
+  const lib = getLib();
+  try {
+    return koffi.decode(ptr, "char", -1);
+  } finally {
+    lib.httpcloak_free_string(ptr);
+  }
+}
+
+// --- Custom Preset Loading ---
+
+/**
+ * Load a custom preset from a JSON file and register it.
+ * @param {string} filePath - Path to the preset JSON file
+ * @returns {string} The registered preset name
+ */
+function loadPreset(filePath) {
+  const lib = getLib();
+  const result = readAndFreeString(lib.httpcloak_preset_load_file(filePath));
+  if (!result) {
+    throw new HTTPCloakError("Failed to load preset from file");
+  }
+  const data = JSON.parse(result);
+  if (data.error) {
+    throw new HTTPCloakError(data.error);
+  }
+  return data.name;
+}
+
+/**
+ * Load a custom preset from a JSON string and register it.
+ * @param {string} jsonData - JSON string defining the preset
+ * @returns {string} The registered preset name
+ */
+function loadPresetFromJSON(jsonData) {
+  const lib = getLib();
+  const result = readAndFreeString(lib.httpcloak_preset_load_json(jsonData));
+  if (!result) {
+    throw new HTTPCloakError("Failed to load preset from JSON");
+  }
+  const data = JSON.parse(result);
+  if (data.error) {
+    throw new HTTPCloakError(data.error);
+  }
+  return data.name;
+}
+
+/**
+ * Unregister a custom preset by name.
+ * @param {string} name - The preset name to unregister
+ */
+function unregisterPreset(name) {
+  const lib = getLib();
+  lib.httpcloak_preset_unregister(name);
+}
+
+/**
+ * Return a fully-resolved JSON document for the given preset.
+ *
+ * The output flattens any inheritance chain and resolves H2/H3 defaults
+ * (Chrome unless the preset overrides) into explicit values, so the
+ * result is suitable for saving, editing, and reloading via
+ * loadPresetFromJSON. Two consecutive calls return byte-identical JSON.
+ *
+ * @param {string} name - The preset name (built-in or custom-registered).
+ * @returns {string} JSON string of the form {"version":1,"preset":{...}}.
+ * @throws {HTTPCloakError} If the preset is not registered or references
+ *   an unknown utls ClientHelloID.
+ */
+function describePreset(name) {
+  const lib = getLib();
+  const result = lib.httpcloak_describe_preset(name);
+  if (!result) {
+    throw new HTTPCloakError(`Failed to describe preset: ${name}`);
+  }
+  // The error envelope ({"error": "..."}) is also a valid JSON document.
+  // A successful describe always carries a top-level "preset" field, so
+  // distinguishing the two is straightforward.
+  let parsed;
+  try {
+    parsed = JSON.parse(result);
+  } catch (err) {
+    throw new HTTPCloakError(`Invalid describe_preset response: ${err.message}`);
+  }
+  if (parsed && parsed.error && !parsed.preset) {
+    throw new HTTPCloakError(parsed.error);
+  }
+  return result;
+}
+
+/**
+ * A pool of custom fingerprint presets for rotation.
+ *
+ * Pools load multiple presets from a single JSON file and provide
+ * round-robin or random selection. All presets are auto-registered
+ * on construction, so you can pass the returned name directly to
+ * Session({ preset: name }).
+ */
+class PresetPool {
+  /**
+   * Load a preset pool from a JSON file.
+   * @param {string} filePath - Path to the pool JSON file
+   */
+  constructor(filePath) {
+    this._lib = getLib();
+    const result = readAndFreeString(this._lib.httpcloak_pool_load_file(filePath));
+    if (!result) {
+      throw new HTTPCloakError(`Failed to load preset pool from file: ${filePath}`);
+    }
+    const data = JSON.parse(result);
+    if (data.error) {
+      throw new HTTPCloakError(data.error);
+    }
+    this._handle = BigInt(data.handle);
+  }
+
+  /**
+   * Load a preset pool from a JSON string.
+   * @param {string} jsonData - JSON string defining the pool
+   * @returns {PresetPool}
+   */
+  static fromJSON(jsonData) {
+    const pool = Object.create(PresetPool.prototype);
+    pool._lib = getLib();
+    const result = readAndFreeString(pool._lib.httpcloak_pool_load_json(jsonData));
+    if (!result) {
+      throw new HTTPCloakError("Failed to load preset pool from JSON");
+    }
+    const data = JSON.parse(result);
+    if (data.error) {
+      throw new HTTPCloakError(data.error);
+    }
+    pool._handle = BigInt(data.handle);
+    return pool;
+  }
+
+  /**
+   * Pick a preset using the pool's configured strategy.
+   * @returns {string} Preset name
+   */
+  pick() {
+    this._checkHandle();
+    return this._parsePoolResult(this._lib.httpcloak_pool_pick(this._handle));
+  }
+
+  /**
+   * Pick a random preset from the pool.
+   * @returns {string} Preset name
+   */
+  random() {
+    this._checkHandle();
+    return this._parsePoolResult(this._lib.httpcloak_pool_random(this._handle));
+  }
+
+  /**
+   * Pick the next preset in round-robin order.
+   * @returns {string} Preset name
+   */
+  next() {
+    this._checkHandle();
+    return this._parsePoolResult(this._lib.httpcloak_pool_next(this._handle));
+  }
+
+  /**
+   * Get a preset by index.
+   * @param {number} index - Zero-based index
+   * @returns {string} Preset name
+   */
+  get(index) {
+    this._checkHandle();
+    return this._parsePoolResult(this._lib.httpcloak_pool_get(this._handle, index));
+  }
+
+  /**
+   * Number of presets in the pool.
+   * @type {number}
+   */
+  get size() {
+    this._checkHandle();
+    const s = this._lib.httpcloak_pool_size(this._handle);
+    if (s < 0) {
+      throw new HTTPCloakError("Failed to get pool size");
+    }
+    return Number(s);
+  }
+
+  /**
+   * Name of the preset pool.
+   * @type {string}
+   */
+  get name() {
+    this._checkHandle();
+    return this._parsePoolResult(this._lib.httpcloak_pool_name(this._handle));
+  }
+
+  /**
+   * Free the pool handle and unregister all its presets.
+   */
+  close() {
+    if (this._handle && this._handle !== 0n && this._handle !== 0) {
+      this._lib.httpcloak_pool_free(this._handle);
+      this._handle = 0n;
+    }
+  }
+
+  _parsePoolResult(resultPtr) {
+    const result = readAndFreeString(resultPtr);
+    if (!result) {
+      throw new HTTPCloakError("No result from preset pool");
+    }
+    // Error responses are JSON with {"error":"..."}
+    if (result.startsWith("{")) {
+      const data = JSON.parse(result);
+      if (data.error) {
+        throw new HTTPCloakError(data.error);
+      }
+    }
+    return result;
+  }
+
+  _checkHandle() {
+    if (!this._handle || this._handle === 0n || this._handle === 0) {
+      throw new HTTPCloakError("PresetPool is closed");
+    }
+  }
+}
+
 module.exports = {
   // Classes
   Session,
   LocalProxy,
+  PresetPool,
   Response,
   FastResponse,
   StreamResponse,
@@ -3551,6 +3882,11 @@ module.exports = {
   SessionCacheBackend,
   // Presets
   Preset,
+  // Custom preset loading
+  loadPreset,
+  loadPresetFromJSON,
+  unregisterPreset,
+  describePreset,
   // Configuration
   configure,
   configureSessionCache,

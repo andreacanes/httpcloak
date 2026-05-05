@@ -11,11 +11,13 @@ import (
 // JA3Extras provides extension data that JA3 cannot capture.
 // JA3 only encodes extension IDs, not the data within them.
 type JA3Extras struct {
-	SignatureAlgorithms []tls.SignatureScheme
-	ALPN               []string
-	CertCompAlgs       []tls.CertCompressionAlgo
-	PermuteExtensions  bool
-	RecordSizeLimit    uint16 // default: 0x4001
+	SignatureAlgorithms            []tls.SignatureScheme
+	DelegatedCredentialAlgorithms  []tls.SignatureScheme // for ext 34; nil = Chrome defaults
+	ALPN                           []string
+	CertCompAlgs                   []tls.CertCompressionAlgo
+	PermuteExtensions              bool
+	RecordSizeLimit                uint16 // default: 0x4001
+	KeyShareCurves                 int    // number of curves to send key shares for; 0 = 1 (default)
 }
 
 // defaultJA3Extras returns sensible defaults matching modern Chrome.
@@ -228,13 +230,18 @@ func extensionForID(id uint16, extras *JA3Extras, curves []tls.CurveID, pointFor
 		return &tls.FakeRecordSizeLimitExtension{Limit: limit}
 
 	case 34: // delegated_credentials
-		return &tls.DelegatedCredentialsExtension{
-			SupportedSignatureAlgorithms: []tls.SignatureScheme{
+		dcAlgs := extras.DelegatedCredentialAlgorithms
+		if dcAlgs == nil {
+			// Chrome default
+			dcAlgs = []tls.SignatureScheme{
 				tls.ECDSAWithP256AndSHA256,
 				tls.ECDSAWithP384AndSHA384,
 				tls.ECDSAWithP521AndSHA512,
 				tls.ECDSAWithSHA1,
-			},
+			}
+		}
+		return &tls.DelegatedCredentialsExtension{
+			SupportedSignatureAlgorithms: dcAlgs,
 		}
 
 	case 35: // session_ticket
@@ -281,14 +288,39 @@ func extensionForID(id uint16, extras *JA3Extras, curves []tls.CurveID, pointFor
 		}
 
 	case 51: // key_share
-		// Real browsers only generate a key share for the first (preferred) curve.
-		// Generating shares for all curves is a detectable fingerprinting signal.
-		// The server sends HelloRetryRequest if it prefers a different group.
+		// By default, send key share for the first non-GREASE curve only.
+		// Firefox 148 sends key shares for 3 curves (X25519MLKEM768, X25519, P-256).
+		// Use extras.KeyShareCurves to control how many key shares are sent.
+		maxShares := 1
+		if extras.KeyShareCurves > 0 {
+			maxShares = extras.KeyShareCurves
+		}
+		// Hybrid post-quantum curves (X25519MLKEM768, X25519Kyber768Draft00)
+		// must be paired with a classical X25519 key share — every real Chrome
+		// and Firefox does this, and utls' TLS 1.3 handshake consistency check
+		// requires keyShareKeys.ecdhe to be non-nil even when the spec only
+		// has an MLKEM share, so a single MLKEM share trips
+		// `local error: tls: internal error` before any wire traffic.
+		// Auto-bump to 2 shares when the first non-GREASE curve is hybrid PQ.
+		if maxShares < 2 {
+			for _, curve := range curves {
+				if isGREASE(uint16(curve)) {
+					continue
+				}
+				if uint16(curve) == 0x11EC || uint16(curve) == 0x6399 {
+					// 0x11EC = X25519MLKEM768 (4588), 0x6399 = X25519Kyber768Draft00 (25497)
+					maxShares = 2
+				}
+				break
+			}
+		}
 		var keyShares []tls.KeyShare
 		for _, curve := range curves {
 			if !isGREASE(uint16(curve)) {
 				keyShares = append(keyShares, tls.KeyShare{Group: curve})
-				break
+				if len(keyShares) >= maxShares {
+					break
+				}
 			}
 		}
 		return &tls.KeyShareExtension{KeyShares: keyShares}
@@ -357,4 +389,19 @@ func parseDashSeparatedUint8(s string) ([]uint8, error) {
 		result = append(result, uint8(v))
 	}
 	return result, nil
+}
+
+// JA3HasExtension checks if a JA3 string contains a specific TLS extension ID.
+// The extensions field is the third comma-separated part, with dash-separated IDs.
+func JA3HasExtension(ja3, extID string) bool {
+	parts := strings.Split(ja3, ",")
+	if len(parts) < 3 {
+		return false
+	}
+	for _, id := range strings.Split(parts[2], "-") {
+		if strings.TrimSpace(id) == extID {
+			return true
+		}
+	}
+	return false
 }

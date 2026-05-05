@@ -151,10 +151,14 @@ func NewHostPool(host, port string, preset *fingerprint.Preset, dnsCache *dns.Ca
 
 	// Generate specs for standalone usage (backward compatibility)
 	var cachedSpec, cachedPSKSpec *utls.ClientHelloSpec
-	if spec, err := utls.UTLSIdToSpecWithSeed(preset.ClientHelloID, shuffleSeed); err == nil {
+	if preset.JA3 != "" {
+		if spec, err := fingerprint.ParseJA3(preset.JA3, preset.JA3Extras); err == nil {
+			cachedSpec = spec
+		}
+	} else if spec, err := utls.UTLSIdToSpecWithSeed(preset.ClientHelloID, shuffleSeed); err == nil {
 		cachedSpec = &spec
 	}
-	if preset.PSKClientHelloID.Client != "" {
+	if preset.JA3 == "" && preset.PSKClientHelloID.Client != "" {
 		if spec, err := utls.UTLSIdToSpecWithSeed(preset.PSKClientHelloID, shuffleSeed); err == nil {
 			cachedPSKSpec = &spec
 		}
@@ -334,16 +338,26 @@ func (p *HostPool) createConn(ctx context.Context) (*Conn, error) {
 	// Wrap with uTLS for fingerprinting
 	// Enable session tickets for PSK resumption (Chrome does this)
 	// Use sniHost (original request host) for TLS ServerName, not p.host (which may be connectTo target)
+	// Only set session cache on tlsConfig when PSK is available (via cached PSK spec
+	// or JA3 with extension 41). Prevents the TLS library from attempting session
+	// resumption on specs without PSK extension.
+	hasPSK := p.cachedPSKSpec != nil || (p.preset.JA3 != "" && fingerprint.JA3HasExtension(p.preset.JA3, "41"))
+	var sessionCache utls.ClientSessionCache
+	if hasPSK {
+		sessionCache = p.sessionCache
+	}
+
 	tlsConfig := &utls.Config{
-		ServerName:                     p.sniHost,
-		InsecureSkipVerify:             p.insecureSkipVerify,
-		MinVersion:                     minVersion,
-		MaxVersion:                     tls.VersionTLS13,
-		SessionTicketsDisabled:         false,          // Enable session tickets
-		ClientSessionCache:             p.sessionCache, // Use per-host session cache
-		OmitEmptyPsk:                   true,           // Chrome doesn't send empty PSK on first connection
-		EncryptedClientHelloConfigList: echConfigList,  // ECH configuration (if available)
-		KeyLogWriter:                   keyLogWriter,
+		ServerName:                          p.sniHost,
+		InsecureSkipVerify:                  p.insecureSkipVerify,
+		MinVersion:                          minVersion,
+		MaxVersion:                          tls.VersionTLS13,
+		SessionTicketsDisabled:              false,         // Enable session tickets
+		ClientSessionCache:                  sessionCache,  // Only set when PSK is available
+		OmitEmptyPsk:                        true,          // Chrome doesn't send empty PSK on first connection
+		PreferSkipResumptionOnNilExtension:  true,          // Safety net: skip resumption if spec lacks PSK extension
+		EncryptedClientHelloConfigList:      echConfigList, // ECH configuration (if available)
+		KeyLogWriter:                        keyLogWriter,
 	}
 
 	// Generate fresh spec for this connection to avoid race condition
@@ -352,14 +366,22 @@ func (p *HostPool) createConn(ctx context.Context) (*Conn, error) {
 	var specToUse *utls.ClientHelloSpec
 	var tlsConn *utls.UConn
 
-	// Prefer PSK spec when available - Chrome always includes PSK extension structure
-	if p.cachedPSKSpec != nil && p.preset.PSKClientHelloID.Client != "" {
+	// JA3 preset: parse fresh per connection (ApplyPreset mutates the spec)
+	if p.preset.JA3 != "" {
+		spec, err := fingerprint.ParseJA3(p.preset.JA3, p.preset.JA3Extras)
+		if err != nil {
+			rawConn.Close()
+			return nil, fmt.Errorf("failed to parse JA3: %w", err)
+		}
+		specToUse = spec
+	} else if p.cachedPSKSpec != nil && p.preset.PSKClientHelloID.Client != "" {
+		// Prefer PSK spec when available - Chrome always includes PSK extension structure
 		// Generate fresh PSK spec for this connection
 		if spec, err := utls.UTLSIdToSpecWithSeed(p.preset.PSKClientHelloID, p.shuffleSeed); err == nil {
 			specToUse = &spec
 		}
 	}
-	if specToUse == nil && p.cachedSpec != nil {
+	if specToUse == nil && p.cachedSpec != nil && p.preset.JA3 == "" {
 		// Generate fresh regular spec
 		if spec, err := utls.UTLSIdToSpecWithSeed(p.preset.ClientHelloID, p.shuffleSeed); err == nil {
 			specToUse = &spec
@@ -382,9 +404,8 @@ func (p *HostPool) createConn(ctx context.Context) (*Conn, error) {
 		tlsConn = utls.UClient(rawConn, tlsConfig, clientHelloID)
 	}
 
-	// Only enable session cache if we have PSK spec - prevents panic when session
-	// is cached but spec doesn't have PSK extension (TOCTOU race mitigation)
-	if p.cachedPSKSpec != nil {
+	// Enable session cache if PSK is available (either via cached PSK spec or JA3 with extension 41)
+	if p.cachedPSKSpec != nil || (p.preset.JA3 != "" && fingerprint.JA3HasExtension(p.preset.JA3, "41")) {
 		tlsConn.SetSessionCache(p.sessionCache)
 	}
 
@@ -410,9 +431,12 @@ func (p *HostPool) createConn(ctx context.Context) (*Conn, error) {
 		// Native fingerprinting via sardanioss/net
 		ConnectionFlow: settings.ConnectionWindowUpdate,
 		Settings:       buildHTTP2Settings(settings),
-		SettingsOrder:  buildHTTP2SettingsOrder(settings),
+		SettingsOrder:  buildHTTP2SettingsOrder(settings, p.preset),
 		PseudoHeaderOrder: func() []string {
-			// Safari/iOS uses m,s,p,a order; Chrome uses m,a,s,p
+			// Preset H2Config > Safari/Chrome heuristic
+			if order := p.preset.H2PseudoHeaderOrder(); order != nil {
+				return order
+			}
 			if settings.NoRFC7540Priorities {
 				return []string{":method", ":scheme", ":path", ":authority"} // Safari order (m,s,p,a)
 			}
@@ -430,23 +454,12 @@ func (p *HostPool) createConn(ctx context.Context) (*Conn, error) {
 			}
 			return nil
 		}(),
-		HeaderOrder: []string{
-			// Chrome 143 header order (verified via tls.peet.ws)
-			"cache-control", // appears on reload/session resumption
-			"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-			"upgrade-insecure-requests", "user-agent",
-			"content-type", "content-length", // for POST requests
-			"accept", "origin", // origin for CORS
-			"sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest",
-			"referer",
-			"accept-encoding", "accept-language",
-			"cookie", "priority",
-		},
+		HeaderOrder:         p.preset.H2HeaderOrder(),
 		UserAgent:           p.preset.UserAgent,
-		StreamPriorityMode:  http2.StreamPriorityChrome,
-		HPACKIndexingPolicy: hpack.IndexingChrome,
-		HPACKNeverIndex:     []string{"cookie", "authorization", "proxy-authorization"},
-		DisableCookieSplit:  true, // Chrome sends cookies as one HPACK entry, not split per RFC 9113
+		StreamPriorityMode:  resolveStreamPriorityMode(p.preset.H2StreamPriorityMode()),
+		HPACKIndexingPolicy: resolveHPACKIndexingPolicy(p.preset.H2HPACKIndexingPolicy()),
+		HPACKNeverIndex:     p.preset.H2HPACKNeverIndex(),
+		DisableCookieSplit:  p.preset.H2DisableCookieSplit(),
 	}
 
 	h2Conn, err := h2Transport.NewClientConn(tlsConn)
@@ -1019,12 +1032,16 @@ func NewManagerWithTLSConfig(preset *fingerprint.Preset, insecureSkipVerify bool
 
 	// Generate and cache ClientHelloSpec with shuffled extensions
 	// Chrome shuffles extensions once per session, not per connection
-	if spec, err := utls.UTLSIdToSpecWithSeed(preset.ClientHelloID, shuffleSeed); err == nil {
+	if preset.JA3 != "" {
+		if spec, err := fingerprint.ParseJA3(preset.JA3, preset.JA3Extras); err == nil {
+			m.cachedSpec = spec
+		}
+	} else if spec, err := utls.UTLSIdToSpecWithSeed(preset.ClientHelloID, shuffleSeed); err == nil {
 		m.cachedSpec = &spec
 	}
 
-	// Also cache PSK variant if available
-	if preset.PSKClientHelloID.Client != "" {
+	// Also cache PSK variant if available (not applicable for JA3 presets)
+	if preset.JA3 == "" && preset.PSKClientHelloID.Client != "" {
 		if spec, err := utls.UTLSIdToSpecWithSeed(preset.PSKClientHelloID, shuffleSeed); err == nil {
 			m.cachedPSKSpec = &spec
 		}
@@ -1056,12 +1073,16 @@ func NewManagerWithProxy(preset *fingerprint.Preset, proxyURL string, insecureSk
 	}
 
 	// Generate and cache ClientHelloSpec with shuffled extensions
-	if spec, err := utls.UTLSIdToSpecWithSeed(preset.ClientHelloID, shuffleSeed); err == nil {
+	if preset.JA3 != "" {
+		if spec, err := fingerprint.ParseJA3(preset.JA3, preset.JA3Extras); err == nil {
+			m.cachedSpec = spec
+		}
+	} else if spec, err := utls.UTLSIdToSpecWithSeed(preset.ClientHelloID, shuffleSeed); err == nil {
 		m.cachedSpec = &spec
 	}
 
-	// Also cache PSK variant if available
-	if preset.PSKClientHelloID.Client != "" {
+	// Also cache PSK variant if available (not applicable for JA3 presets)
+	if preset.JA3 == "" && preset.PSKClientHelloID.Client != "" {
 		if spec, err := utls.UTLSIdToSpecWithSeed(preset.PSKClientHelloID, shuffleSeed); err == nil {
 			m.cachedPSKSpec = &spec
 		}
@@ -1305,6 +1326,43 @@ func (m *Manager) Stats() map[string]struct {
 	return stats
 }
 
+// resolveStreamPriorityMode converts a string mode to the http2 constant.
+func resolveStreamPriorityMode(mode string) http2.StreamPriorityMode {
+	switch mode {
+	case "chrome":
+		return http2.StreamPriorityChrome
+	case "default":
+		return http2.StreamPriorityDefault
+	default:
+		return http2.StreamPriorityChrome
+	}
+}
+
+// resolveHPACKIndexingPolicy converts a string policy to the hpack constant.
+func resolveHPACKIndexingPolicy(policy string) hpack.IndexingPolicy {
+	switch policy {
+	case "chrome":
+		return hpack.IndexingChrome
+	case "never":
+		return hpack.IndexingNever
+	case "always":
+		return hpack.IndexingAlways
+	case "default":
+		return hpack.IndexingDefault
+	default:
+		return hpack.IndexingChrome
+	}
+}
+
+// uint16sToSettingIDs converts uint16 slice to http2.SettingID slice.
+func uint16sToSettingIDs(ids []uint16) []http2.SettingID {
+	result := make([]http2.SettingID, len(ids))
+	for i, id := range ids {
+		result[i] = http2.SettingID(id)
+	}
+	return result
+}
+
 // boolToUint32 converts a bool to uint32 (for HTTP/2 SETTINGS)
 func boolToUint32(b bool) uint32 {
 	if b {
@@ -1313,44 +1371,60 @@ func boolToUint32(b bool) uint32 {
 	return 0
 }
 
-// buildHTTP2Settings creates the settings map based on preset configuration
+// buildHTTP2Settings creates the settings map dynamically based on preset configuration.
+// Mirrors http2_transport.go's approach: base settings + conditional additions.
 func buildHTTP2Settings(settings fingerprint.HTTP2Settings) map[http2.SettingID]uint32 {
-	// Safari/iOS uses different settings than Chrome
-	if settings.NoRFC7540Priorities {
-		// Safari/iOS settings: ENABLE_PUSH, INITIAL_WINDOW_SIZE, MAX_CONCURRENT_STREAMS, NO_RFC7540_PRIORITIES
-		return map[http2.SettingID]uint32{
-			http2.SettingEnablePush:           boolToUint32(settings.EnablePush),
-			http2.SettingInitialWindowSize:    settings.InitialWindowSize,
-			http2.SettingMaxConcurrentStreams: settings.MaxConcurrentStreams,
-			http2.SettingNoRFC7540Priorities:  1,
-		}
-	}
-	// Chrome settings: HEADER_TABLE_SIZE, ENABLE_PUSH, INITIAL_WINDOW_SIZE, MAX_HEADER_LIST_SIZE
-	return map[http2.SettingID]uint32{
+	h2Settings := map[http2.SettingID]uint32{
 		http2.SettingHeaderTableSize:   settings.HeaderTableSize,
 		http2.SettingEnablePush:        boolToUint32(settings.EnablePush),
 		http2.SettingInitialWindowSize: settings.InitialWindowSize,
 		http2.SettingMaxHeaderListSize: settings.MaxHeaderListSize,
 	}
+	if settings.MaxConcurrentStreams > 0 {
+		h2Settings[http2.SettingMaxConcurrentStreams] = settings.MaxConcurrentStreams
+	}
+	if settings.MaxFrameSize > 0 {
+		h2Settings[http2.SettingMaxFrameSize] = settings.MaxFrameSize
+	}
+	if settings.NoRFC7540Priorities {
+		h2Settings[http2.SettingNoRFC7540Priorities] = 1
+	}
+	return h2Settings
 }
 
-// buildHTTP2SettingsOrder creates the settings order based on preset configuration
-func buildHTTP2SettingsOrder(settings fingerprint.HTTP2Settings) []http2.SettingID {
-	// Safari/iOS uses different order than Chrome
+// buildHTTP2SettingsOrder creates the settings order based on preset configuration.
+// If the preset has an explicit SettingsOrder, it takes precedence over the heuristic.
+// The fallback dynamically appends conditional settings to match buildHTTP2Settings().
+func buildHTTP2SettingsOrder(settings fingerprint.HTTP2Settings, preset *fingerprint.Preset) []http2.SettingID {
+	if order := preset.H2SettingsOrder(); order != nil {
+		return uint16sToSettingIDs(order)
+	}
+	// Build order dynamically to stay consistent with buildHTTP2Settings() map.
+	// Base order depends on browser type, then conditional settings are appended.
+	var order []http2.SettingID
 	if settings.NoRFC7540Priorities {
-		// Safari/iOS order: 2, 4, 3, 9
-		return []http2.SettingID{
+		// Safari/iOS base order: 2, 4
+		order = []http2.SettingID{
 			http2.SettingEnablePush,
 			http2.SettingInitialWindowSize,
-			http2.SettingMaxConcurrentStreams,
-			http2.SettingNoRFC7540Priorities,
+		}
+	} else {
+		// Chrome base order: 1, 2, 4, 6
+		order = []http2.SettingID{
+			http2.SettingHeaderTableSize,
+			http2.SettingEnablePush,
+			http2.SettingInitialWindowSize,
+			http2.SettingMaxHeaderListSize,
 		}
 	}
-	// Chrome order: 1, 2, 4, 6
-	return []http2.SettingID{
-		http2.SettingHeaderTableSize,
-		http2.SettingEnablePush,
-		http2.SettingInitialWindowSize,
-		http2.SettingMaxHeaderListSize,
+	if settings.MaxConcurrentStreams > 0 {
+		order = append(order, http2.SettingMaxConcurrentStreams)
 	}
+	if settings.MaxFrameSize > 0 {
+		order = append(order, http2.SettingMaxFrameSize)
+	}
+	if settings.NoRFC7540Priorities {
+		order = append(order, http2.SettingNoRFC7540Priorities)
+	}
+	return order
 }

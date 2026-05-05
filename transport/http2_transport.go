@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -107,10 +106,13 @@ func NewHTTP2TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 	crand.Read(seedBytes[:])
 	shuffleSeed := int64(binary.LittleEndian.Uint64(seedBytes[:]))
 
-	// Check if PSK spec is available for this preset or custom JA3
+	// Check if PSK spec is available for this preset, custom JA3, or preset JA3
 	hasPSKSpec := preset.PSKClientHelloID.Client != ""
 	if !hasPSKSpec && config != nil && config.CustomJA3 != "" {
-		hasPSKSpec = ja3HasExtension(config.CustomJA3, "41")
+		hasPSKSpec = fingerprint.JA3HasExtension(config.CustomJA3, "41")
+	}
+	if !hasPSKSpec && preset.JA3 != "" {
+		hasPSKSpec = fingerprint.JA3HasExtension(preset.JA3, "41")
 	}
 
 	t := &HTTP2Transport{
@@ -401,12 +403,22 @@ func (t *HTTP2Transport) createConn(ctx context.Context, host, port string) (*pe
 	// utls's ApplyPreset mutates the spec (clears KeyShares.Data, etc.), so each
 	// connection needs its own copy. Use same shuffleSeed for consistent ordering.
 	var specToUse *utls.ClientHelloSpec
+	// Determine JA3 source: config.CustomJA3 takes priority, then preset.JA3
+	ja3String := ""
+	var ja3Extras *fingerprint.JA3Extras
 	if t.config != nil && t.config.CustomJA3 != "" {
-		// Custom JA3: parse to fresh spec each connection (ApplyPreset mutates)
-		spec, parseErr := fingerprint.ParseJA3(t.config.CustomJA3, t.config.CustomJA3Extras)
+		ja3String = t.config.CustomJA3
+		ja3Extras = t.config.CustomJA3Extras
+	} else if t.preset.JA3 != "" {
+		ja3String = t.preset.JA3
+		ja3Extras = t.preset.JA3Extras
+	}
+	if ja3String != "" {
+		// JA3: parse to fresh spec each connection (ApplyPreset mutates)
+		spec, parseErr := fingerprint.ParseJA3(ja3String, ja3Extras)
 		if parseErr != nil {
 			rawConn.Close()
-			return nil, fmt.Errorf("failed to parse custom JA3: %w", parseErr)
+			return nil, fmt.Errorf("failed to parse JA3: %w", parseErr)
 		}
 		specToUse = spec
 	} else if t.hasPSKSpec {
@@ -506,11 +518,21 @@ func (t *HTTP2Transport) createConn(ctx context.Context, host, port string) (*pe
 
 			// Regenerate fresh TLS spec (the previous one was consumed)
 			var fallbackSpec *utls.ClientHelloSpec
+			// Reuse same JA3 resolution logic as primary path
+			fallbackJA3 := ""
+			var fallbackJA3Extras *fingerprint.JA3Extras
 			if t.config != nil && t.config.CustomJA3 != "" {
-				spec, parseErr := fingerprint.ParseJA3(t.config.CustomJA3, t.config.CustomJA3Extras)
+				fallbackJA3 = t.config.CustomJA3
+				fallbackJA3Extras = t.config.CustomJA3Extras
+			} else if t.preset.JA3 != "" {
+				fallbackJA3 = t.preset.JA3
+				fallbackJA3Extras = t.preset.JA3Extras
+			}
+			if fallbackJA3 != "" {
+				spec, parseErr := fingerprint.ParseJA3(fallbackJA3, fallbackJA3Extras)
 				if parseErr != nil {
 					rawConn.Close()
-					return nil, fmt.Errorf("speculative TLS fallback: failed to parse custom JA3: %w", parseErr)
+					return nil, fmt.Errorf("speculative TLS fallback: failed to parse JA3: %w", parseErr)
 				}
 				fallbackSpec = spec
 			} else if t.hasPSKSpec {
@@ -581,29 +603,53 @@ alpnCheck:
 		http2.SettingInitialWindowSize: settings.InitialWindowSize,
 		http2.SettingMaxHeaderListSize: settings.MaxHeaderListSize,
 	}
-	h2SettingsOrder := []http2.SettingID{
-		http2.SettingHeaderTableSize,
-		http2.SettingEnablePush,
-		http2.SettingInitialWindowSize,
-		http2.SettingMaxHeaderListSize,
+	var h2SettingsOrder []http2.SettingID
+	if order := t.preset.H2SettingsOrder(); order != nil {
+		h2SettingsOrder = uint16sToSettingIDs(order)
+	} else {
+		// Build order dynamically to stay consistent with settings map.
+		// Base order depends on browser type, then conditional settings are appended.
+		if settings.NoRFC7540Priorities {
+			// Safari/iOS base order: 2, 4 (no HeaderTableSize or MaxHeaderListSize)
+			h2SettingsOrder = []http2.SettingID{
+				http2.SettingEnablePush,
+				http2.SettingInitialWindowSize,
+			}
+		} else {
+			// Chrome base order: 1, 2, 4, 6
+			h2SettingsOrder = []http2.SettingID{
+				http2.SettingHeaderTableSize,
+				http2.SettingEnablePush,
+				http2.SettingInitialWindowSize,
+				http2.SettingMaxHeaderListSize,
+			}
+		}
+		if settings.MaxConcurrentStreams > 0 {
+			h2SettingsOrder = append(h2SettingsOrder, http2.SettingMaxConcurrentStreams)
+		}
+		if settings.MaxFrameSize > 0 {
+			h2SettingsOrder = append(h2SettingsOrder, http2.SettingMaxFrameSize)
+		}
+		if settings.NoRFC7540Priorities {
+			h2SettingsOrder = append(h2SettingsOrder, http2.SettingNoRFC7540Priorities)
+		}
 	}
 	if settings.MaxConcurrentStreams > 0 {
 		h2Settings[http2.SettingMaxConcurrentStreams] = settings.MaxConcurrentStreams
-		h2SettingsOrder = append(h2SettingsOrder, http2.SettingMaxConcurrentStreams)
 	}
 	if settings.MaxFrameSize > 0 {
 		h2Settings[http2.SettingMaxFrameSize] = settings.MaxFrameSize
-		h2SettingsOrder = append(h2SettingsOrder, http2.SettingMaxFrameSize)
 	}
 	if settings.NoRFC7540Priorities {
 		h2Settings[http2.SettingNoRFC7540Priorities] = 1
-		h2SettingsOrder = append(h2SettingsOrder, http2.SettingNoRFC7540Priorities)
 	}
 
-	// Pseudo-header order: use custom (Akamai), or browser-type heuristic
+	// Pseudo-header order: custom (Akamai) > preset H2Config > Safari/Chrome heuristic
 	pseudoOrder := []string{":method", ":authority", ":scheme", ":path"} // Chrome default
 	if t.config != nil && len(t.config.CustomPseudoOrder) > 0 {
 		pseudoOrder = t.config.CustomPseudoOrder
+	} else if order := t.preset.H2PseudoHeaderOrder(); order != nil {
+		pseudoOrder = order
 	} else if settings.NoRFC7540Priorities {
 		pseudoOrder = []string{":method", ":scheme", ":path", ":authority"} // Safari order
 	}
@@ -613,6 +659,10 @@ alpnCheck:
 		AllowHTTP:                  false,
 		DisableCompression:         tlsOnly, // Disable auto Accept-Encoding in TLS-only mode
 		StrictMaxConcurrentStreams: false,
+		MaxHeaderListSize:          settings.MaxHeaderListSize,
+		MaxReadFrameSize:           settings.MaxFrameSize,
+		MaxDecoderHeaderTableSize:  settings.HeaderTableSize,
+		MaxEncoderHeaderTableSize:  settings.HeaderTableSize,
 		ReadIdleTimeout:            t.maxIdleTime,
 		PingTimeout:                15 * time.Second,
 
@@ -620,7 +670,7 @@ alpnCheck:
 		ConnectionFlow:     settings.ConnectionWindowUpdate,
 		Settings:           h2Settings,
 		SettingsOrder:      h2SettingsOrder,
-		DisableCookieSplit: true, // Chrome sends cookies as one HPACK entry, not split per RFC 9113
+		DisableCookieSplit: t.preset.H2DisableCookieSplit(),
 		PseudoHeaderOrder: pseudoOrder,
 		HeaderPriority: func() *http2.PriorityParam {
 			// Chrome 120+ uses RFC 9218 extensible priorities (priority: header)
@@ -634,22 +684,38 @@ alpnCheck:
 			}
 			return nil
 		}(),
-		HeaderOrder: []string{
-			// Chrome 143 header order (verified via tls.peet.ws)
-			"cache-control", // appears on reload/session resumption
-			"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-			"upgrade-insecure-requests", "user-agent",
-			"content-type", "content-length", // for POST requests
-			"accept", "origin", // origin for CORS
-			"sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest",
-			"referer",
-			"accept-encoding", "accept-language",
-			"cookie", "priority",
-		},
+		// Per-request priority table override. Chrome 147+ desktop emits a
+		// different stream weight per resource type (sec-fetch-dest), not a
+		// single session-wide value. When the preset defines a PriorityTable,
+		// we install a per-request callback that consults the request's
+		// Sec-Fetch-Dest header and returns the matching wire priority.
+		// The callback returns nil for unknown dest values, in which case the
+		// fork falls back to HeaderPriority above (legacy single-weight). For
+		// presets without a PriorityTable, HeaderPriorityFunc stays nil and
+		// behaviour is identical to the pre-#56 single-weight model.
+		HeaderPriorityFunc: func() func(req *http.Request) *http2.PriorityParam {
+			preset := t.preset
+			if !preset.H2HasPriorityTable() {
+				return nil
+			}
+			return func(req *http.Request) *http2.PriorityParam {
+				dest := req.Header.Get("Sec-Fetch-Dest")
+				weight, exclusive, _, ok := preset.H2PriorityFor(dest)
+				if !ok {
+					return nil // fall back to HeaderPriority static default
+				}
+				return &http2.PriorityParam{
+					Weight:    uint8(weight - 1), // wire format is weight-1; weight is 1..256, never 0
+					Exclusive: exclusive,
+					StreamDep: 0,
+				}
+			}
+		}(),
+		HeaderOrder:         t.preset.H2HeaderOrder(),
 		UserAgent:           userAgent,
-		StreamPriorityMode:  http2.StreamPriorityChrome,
-		HPACKIndexingPolicy: hpack.IndexingChrome,
-		HPACKNeverIndex:     []string{"cookie", "authorization", "proxy-authorization"},
+		StreamPriorityMode:  resolveStreamPriorityMode(t.preset.H2StreamPriorityMode()),
+		HPACKIndexingPolicy: resolveHPACKIndexingPolicy(t.preset.H2HPACKIndexingPolicy()),
+		HPACKNeverIndex:     t.preset.H2HPACKNeverIndex(),
 	}
 
 	h2Conn, err := h2Transport.NewClientConn(tlsConn)
@@ -767,7 +833,7 @@ func (t *HTTP2Transport) dialThroughHTTPProxy(ctx context.Context, targetHost, t
 		connectReq += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", proxyAuth)
 	}
 
-	connectReq += "\r\n"
+	connectReq += "Connection: keep-alive\r\n\r\n"
 
 	// Use speculative TLS only when explicitly enabled and not on the blocklist
 	if t.config != nil && t.config.EnableSpeculativeTLS && !IsProxyNoSpeculative(t.proxy.URL) {
@@ -829,7 +895,7 @@ func (t *HTTP2Transport) dialHTTPProxyBlockingFresh(ctx context.Context, targetH
 	if proxyAuth != "" {
 		connectReq += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", proxyAuth)
 	}
-	connectReq += "\r\n"
+	connectReq += "Connection: keep-alive\r\n\r\n"
 
 	return t.dialHTTPProxyBlocking(ctx, conn, connectReq)
 }
@@ -1190,16 +1256,40 @@ func boolToUint32(b bool) uint32 {
 	return 0
 }
 
-// ja3HasExtension checks if a JA3 string contains a specific extension ID.
-func ja3HasExtension(ja3, extID string) bool {
-	parts := strings.Split(ja3, ",")
-	if len(parts) < 3 {
-		return false
+// resolveStreamPriorityMode converts a string mode to the http2 constant.
+func resolveStreamPriorityMode(mode string) http2.StreamPriorityMode {
+	switch mode {
+	case "chrome":
+		return http2.StreamPriorityChrome
+	case "default":
+		return http2.StreamPriorityDefault
+	default:
+		return http2.StreamPriorityChrome
 	}
-	for _, id := range strings.Split(parts[2], "-") {
-		if strings.TrimSpace(id) == extID {
-			return true
-		}
-	}
-	return false
 }
+
+// resolveHPACKIndexingPolicy converts a string policy to the hpack constant.
+func resolveHPACKIndexingPolicy(policy string) hpack.IndexingPolicy {
+	switch policy {
+	case "chrome":
+		return hpack.IndexingChrome
+	case "never":
+		return hpack.IndexingNever
+	case "always":
+		return hpack.IndexingAlways
+	case "default":
+		return hpack.IndexingDefault
+	default:
+		return hpack.IndexingChrome
+	}
+}
+
+// uint16sToSettingIDs converts uint16 slice to http2.SettingID slice.
+func uint16sToSettingIDs(ids []uint16) []http2.SettingID {
+	result := make([]http2.SettingID, len(ids))
+	for i, id := range ids {
+		result[i] = http2.SettingID(id)
+	}
+	return result
+}
+

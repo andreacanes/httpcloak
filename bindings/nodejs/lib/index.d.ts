@@ -270,6 +270,19 @@ export interface RequestOptions {
   auth?: [string, string];
   /** Optional request timeout in seconds */
   timeout?: number;
+  /**
+   * Explicit Sec-Fetch-Mode/Dest override for requests where auto-sniffing isn't enough.
+   *
+   * Valid values:
+   * - `"cors"` - XHR/fetch() request (Sec-Fetch-Mode: cors, Sec-Fetch-Dest: empty, Sec-Fetch-Site: same-origin)
+   * - `"no-cors"` - Subresource load (image/script/stylesheet tag)
+   * - `"navigate"` - Top-level navigation (document load, classic form POST)
+   * - `"websocket"` - WebSocket upgrade
+   *
+   * When unset (default), httpcloak auto-detects based on method, Accept, Content-Type, and Sec-Fetch-Dest headers.
+   * Set this explicitly when the auto-sniff gets it wrong (e.g., POST to a CORS endpoint without a JSON Accept header).
+   */
+  fetchMode?: "cors" | "no-cors" | "navigate" | "websocket";
 }
 
 export class Session {
@@ -1022,3 +1035,66 @@ export function configureSessionCache(options: SessionCacheOptions): SessionCach
  * After calling this, new sessions will not use distributed caching.
  */
 export function clearSessionCache(): void;
+
+/**
+ * Load a custom preset from a JSON file and register it.
+ * @param filePath - Path to the preset JSON file
+ * @returns The registered preset name
+ */
+export function loadPreset(filePath: string): string;
+
+/**
+ * Load a custom preset from a JSON string and register it.
+ * @param jsonData - JSON string defining the preset
+ * @returns The registered preset name
+ */
+export function loadPresetFromJSON(jsonData: string): string;
+
+/**
+ * Unregister a custom preset by name.
+ * @param name - The preset name to unregister
+ */
+export function unregisterPreset(name: string): void;
+
+/**
+ * A pool of custom fingerprint presets for rotation.
+ *
+ * Pools load multiple presets from a single JSON file and provide
+ * round-robin or random selection. All presets are auto-registered
+ * on construction, so you can pass the returned name directly to
+ * `new Session({ preset: name })`.
+ */
+export class PresetPool {
+  /**
+   * Load a preset pool from a JSON file.
+   * @param filePath - Path to the pool JSON file
+   */
+  constructor(filePath: string);
+
+  /**
+   * Load a preset pool from a JSON string.
+   * @param jsonData - JSON string defining the pool
+   */
+  static fromJSON(jsonData: string): PresetPool;
+
+  /** Pick a preset using the pool's configured strategy. */
+  pick(): string;
+
+  /** Pick a random preset from the pool. */
+  random(): string;
+
+  /** Pick the next preset in round-robin order. */
+  next(): string;
+
+  /** Get a preset by index. */
+  get(index: number): string;
+
+  /** Number of presets in the pool. */
+  readonly size: number;
+
+  /** Name of the preset pool. */
+  readonly name: string;
+
+  /** Free the pool handle and unregister all its presets. */
+  close(): void;
+}

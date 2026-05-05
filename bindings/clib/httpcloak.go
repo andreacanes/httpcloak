@@ -116,8 +116,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/sardanioss/httpcloak"
@@ -141,6 +143,18 @@ func decodeRequestBody(body, encoding string) ([]byte, error) {
 	return []byte(body), nil
 }
 
+// encodeResponseBody serializes a response body into ResponseData.Body/BodyEncoding.
+// Valid UTF-8 passes through as a plain string (back-compat, no size overhead).
+// Non-UTF-8 bodies (PDFs, images, compressed streams, etc.) are base64-encoded so
+// they survive json.Marshal without U+FFFD replacement corrupting every non-ASCII
+// byte. Bindings must check body_encoding and base64-decode when it equals "base64".
+func encodeResponseBody(b []byte) (string, string) {
+	if utf8.Valid(b) {
+		return string(b), ""
+	}
+	return base64.StdEncoding.EncodeToString(b), "base64"
+}
+
 // Session handle management
 var (
 	sessionMu      sync.RWMutex
@@ -161,6 +175,19 @@ var (
 	uploads       = make(map[int64]*UploadStream)
 	uploadCounter int64
 )
+
+// Preset pool handle management
+var (
+	presetPoolMu      sync.RWMutex
+	presetPools       = make(map[int64]*fingerprint.PresetPool)
+	presetPoolCounter int64
+)
+
+func getPresetPool(handle C.int64_t) *fingerprint.PresetPool {
+	presetPoolMu.RLock()
+	defer presetPoolMu.RUnlock()
+	return presetPools[int64(handle)]
+}
 
 // UploadStream represents an in-progress streaming upload
 type UploadStream struct {
@@ -198,6 +225,9 @@ type RequestConfig struct {
 	Body         string            `json:"body,omitempty"`
 	BodyEncoding string            `json:"body_encoding,omitempty"` // "text" (default) or "base64"
 	Timeout      int               `json:"timeout,omitempty"`       // seconds
+	// FetchMode explicitly forces Sec-Fetch-Mode and bypasses auto-sniffing.
+	// Valid values: "cors", "no-cors", "navigate", "websocket". Empty = auto.
+	FetchMode string `json:"fetch_mode,omitempty"`
 }
 
 // Cookie represents a parsed cookie from Set-Cookie header
@@ -222,13 +252,14 @@ type RedirectInfo struct {
 
 // Response for JSON serialization (legacy - includes body as string)
 type ResponseData struct {
-	StatusCode int                 `json:"status_code"`
-	Headers    map[string][]string `json:"headers"`
-	Body       string              `json:"body"`
-	FinalURL   string              `json:"final_url"`
-	Protocol   string              `json:"protocol"`
-	Cookies    []Cookie            `json:"cookies"`
-	History    []RedirectInfo      `json:"history"`
+	StatusCode   int                 `json:"status_code"`
+	Headers      map[string][]string `json:"headers"`
+	Body         string              `json:"body"`
+	BodyEncoding string              `json:"body_encoding,omitempty"` // "" (text) or "base64"
+	FinalURL     string              `json:"final_url"`
+	Protocol     string              `json:"protocol"`
+	Cookies      []Cookie            `json:"cookies"`
+	History      []RedirectInfo      `json:"history"`
 }
 
 // ResponseMetadata for optimized responses - body is passed separately as raw bytes
@@ -509,6 +540,47 @@ func convertHeaders(headers map[string]string) map[string][]string {
 	return result
 }
 
+// buildHeaders combines user headers with optional fetch_mode override. When
+// fetch_mode is set, it's injected as the Sec-Fetch-Mode header (and a
+// coherent Sec-Fetch-Dest when appropriate) so the Go core's mode picker
+// treats it as an explicit user intent. User-supplied Sec-Fetch-* headers
+// still win.
+func buildHeaders(rawHeaders map[string]string, fetchMode string) map[string][]string {
+	h := convertHeaders(rawHeaders)
+	fetchMode = strings.ToLower(strings.TrimSpace(fetchMode))
+	if fetchMode == "" {
+		return h
+	}
+	if h == nil {
+		h = make(map[string][]string)
+	}
+	hasHeader := func(name string) bool {
+		for k := range h {
+			if strings.EqualFold(k, name) {
+				return true
+			}
+		}
+		return false
+	}
+	switch fetchMode {
+	case "cors", "no-cors", "navigate", "websocket":
+		if !hasHeader("Sec-Fetch-Mode") {
+			h["Sec-Fetch-Mode"] = []string{fetchMode}
+		}
+		// Pair a coherent default Sec-Fetch-Dest when the user didn't supply
+		// one. Keeps the final header set self-consistent.
+		if !hasHeader("Sec-Fetch-Dest") {
+			switch fetchMode {
+			case "cors", "websocket":
+				h["Sec-Fetch-Dest"] = []string{"empty"}
+			case "navigate":
+				h["Sec-Fetch-Dest"] = []string{"document"}
+			}
+		}
+	}
+	return h
+}
+
 func makeResponseJSON(resp *httpcloak.Response) *C.char {
 	// Read body from io.ReadCloser
 	var bodyBytes []byte
@@ -533,14 +605,16 @@ func makeResponseJSON(resp *httpcloak.Response) *C.char {
 		}
 	}
 
+	body, bodyEncoding := encodeResponseBody(bodyBytes)
 	data := ResponseData{
-		StatusCode: resp.StatusCode,
-		Headers:    resp.Headers,
-		Body:       string(bodyBytes),
-		FinalURL:   resp.FinalURL,
-		Protocol:   resp.Protocol,
-		Cookies:    cookies,
-		History:    history,
+		StatusCode:   resp.StatusCode,
+		Headers:      resp.Headers,
+		Body:         body,
+		BodyEncoding: bodyEncoding,
+		FinalURL:     resp.FinalURL,
+		Protocol:     resp.Protocol,
+		Cookies:      cookies,
+		History:      history,
 	}
 	jsonData, _ := json.Marshal(data)
 	return C.CString(string(jsonData))
@@ -749,7 +823,7 @@ func httpcloak_get_raw(handle C.int64_t, url *C.char, optionsJSON *C.char) C.int
 	req := &httpcloak.Request{
 		Method:  "GET",
 		URL:     urlStr,
-		Headers: convertHeaders(options.Headers),
+		Headers: buildHeaders(options.Headers, options.FetchMode),
 	}
 
 	resp, err := session.Do(ctx, req)
@@ -798,7 +872,7 @@ func httpcloak_post_raw(handle C.int64_t, url *C.char, body *C.char, bodyLen C.i
 	req := &httpcloak.Request{
 		Method:  "POST",
 		URL:     urlStr,
-		Headers: convertHeaders(options.Headers),
+		Headers: buildHeaders(options.Headers, options.FetchMode),
 		Body:    bodyReader,
 	}
 
@@ -856,7 +930,7 @@ func httpcloak_request_raw(handle C.int64_t, requestJSON *C.char, body *C.char, 
 	req := &httpcloak.Request{
 		Method:  method,
 		URL:     config.URL,
-		Headers: convertHeaders(config.Headers),
+		Headers: buildHeaders(config.Headers, config.FetchMode),
 		Body:    bodyReader,
 	}
 
@@ -1185,6 +1259,9 @@ func httpcloak_session_fork(handle C.int64_t) C.int64_t {
 type RequestOptions struct {
 	Headers map[string]string `json:"headers,omitempty"`
 	Timeout int               `json:"timeout,omitempty"` // milliseconds
+	// FetchMode explicitly forces Sec-Fetch-Mode and bypasses auto-sniffing.
+	// Valid values: "cors", "no-cors", "navigate", "websocket". Empty = auto.
+	FetchMode string `json:"fetch_mode,omitempty"`
 }
 
 //export httpcloak_get
@@ -1219,7 +1296,7 @@ func httpcloak_get(handle C.int64_t, url *C.char, optionsJSON *C.char) *C.char {
 	req := &httpcloak.Request{
 		Method:  "GET",
 		URL:     urlStr,
-		Headers: convertHeaders(options.Headers),
+		Headers: buildHeaders(options.Headers, options.FetchMode),
 	}
 
 	resp, err := session.Do(ctx, req)
@@ -1271,7 +1348,7 @@ func httpcloak_post(handle C.int64_t, url *C.char, body *C.char, optionsJSON *C.
 	req := &httpcloak.Request{
 		Method:  "POST",
 		URL:     urlStr,
-		Headers: convertHeaders(options.Headers),
+		Headers: buildHeaders(options.Headers, options.FetchMode),
 		Body:    bodyReader,
 	}
 
@@ -1325,7 +1402,7 @@ func httpcloak_request(handle C.int64_t, requestJSON *C.char) *C.char {
 	req := &httpcloak.Request{
 		Method:  config.Method,
 		URL:     config.URL,
-		Headers: convertHeaders(config.Headers),
+		Headers: buildHeaders(config.Headers, config.FetchMode),
 		Body:    bodyReader,
 	}
 
@@ -1417,8 +1494,21 @@ func httpcloak_get_async(handle C.int64_t, url *C.char, optionsJSON *C.char, cal
 		}
 	}
 
-	// Create cancellable context and store cancel func for this request
+	// Create cancellable context and store cancel func for this request.
+	// Layer the user-supplied timeout on top so per-request timeouts are
+	// actually honored — previously options.Timeout was parsed but never
+	// applied here, silently dropping the value passed by Node.js callers.
+	// Unit matches httpcloak_request_async: seconds.
 	ctx, cancel := context.WithCancel(context.Background())
+	if options.Timeout > 0 {
+		var timeoutCancel context.CancelFunc
+		ctx, timeoutCancel = context.WithTimeout(ctx, time.Duration(options.Timeout)*time.Second)
+		origCancel := cancel
+		cancel = func() {
+			timeoutCancel()
+			origCancel()
+		}
+	}
 	callbackMu.Lock()
 	cancelFuncs[int64(callbackID)] = cancel
 	callbackMu.Unlock()
@@ -1433,7 +1523,7 @@ func httpcloak_get_async(handle C.int64_t, url *C.char, optionsJSON *C.char, cal
 		req := &httpcloak.Request{
 			Method:  "GET",
 			URL:     urlStr,
-			Headers: convertHeaders(options.Headers),
+			Headers: buildHeaders(options.Headers, options.FetchMode),
 		}
 
 		resp, err := session.Do(ctx, req)
@@ -1467,14 +1557,16 @@ func httpcloak_get_async(handle C.int64_t, url *C.char, optionsJSON *C.char, cal
 			}
 		}
 
+		body, bodyEncoding := encodeResponseBody(bodyBytes)
 		data := ResponseData{
-			StatusCode: resp.StatusCode,
-			Headers:    resp.Headers,
-			Body:       string(bodyBytes),
-			FinalURL:   resp.FinalURL,
-			Protocol:   resp.Protocol,
-			Cookies:    cookies,
-			History:    history,
+			StatusCode:   resp.StatusCode,
+			Headers:      resp.Headers,
+			Body:         body,
+			BodyEncoding: bodyEncoding,
+			FinalURL:     resp.FinalURL,
+			Protocol:     resp.Protocol,
+			Cookies:      cookies,
+			History:      history,
 		}
 		jsonData, _ := json.Marshal(data)
 		invokeCallback(int64(callbackID), string(jsonData), "")
@@ -1499,8 +1591,20 @@ func httpcloak_post_async(handle C.int64_t, url *C.char, body *C.char, optionsJS
 		}
 	}
 
-	// Create cancellable context and store cancel func for this request
+	// Create cancellable context and store cancel func for this request.
+	// Layer the user-supplied timeout on top so per-request timeouts are
+	// actually honored — previously options.Timeout was parsed but never
+	// applied here. Unit matches httpcloak_request_async: seconds.
 	ctx, cancel := context.WithCancel(context.Background())
+	if options.Timeout > 0 {
+		var timeoutCancel context.CancelFunc
+		ctx, timeoutCancel = context.WithTimeout(ctx, time.Duration(options.Timeout)*time.Second)
+		origCancel := cancel
+		cancel = func() {
+			timeoutCancel()
+			origCancel()
+		}
+	}
 	callbackMu.Lock()
 	cancelFuncs[int64(callbackID)] = cancel
 	callbackMu.Unlock()
@@ -1520,7 +1624,7 @@ func httpcloak_post_async(handle C.int64_t, url *C.char, body *C.char, optionsJS
 		req := &httpcloak.Request{
 			Method:  "POST",
 			URL:     urlStr,
-			Headers: convertHeaders(options.Headers),
+			Headers: buildHeaders(options.Headers, options.FetchMode),
 			Body:    bodyReader,
 		}
 
@@ -1555,14 +1659,16 @@ func httpcloak_post_async(handle C.int64_t, url *C.char, body *C.char, optionsJS
 			}
 		}
 
+		body, bodyEncoding := encodeResponseBody(bodyBytes)
 		data := ResponseData{
-			StatusCode: resp.StatusCode,
-			Headers:    resp.Headers,
-			Body:       string(bodyBytes),
-			FinalURL:   resp.FinalURL,
-			Protocol:   resp.Protocol,
-			Cookies:    cookies,
-			History:    history,
+			StatusCode:   resp.StatusCode,
+			Headers:      resp.Headers,
+			Body:         body,
+			BodyEncoding: bodyEncoding,
+			FinalURL:     resp.FinalURL,
+			Protocol:     resp.Protocol,
+			Cookies:      cookies,
+			History:      history,
 		}
 		jsonData, _ := json.Marshal(data)
 		invokeCallback(int64(callbackID), string(jsonData), "")
@@ -1618,7 +1724,7 @@ func httpcloak_request_async(handle C.int64_t, requestJSON *C.char, callbackID C
 		req := &httpcloak.Request{
 			Method:  config.Method,
 			URL:     config.URL,
-			Headers: convertHeaders(config.Headers),
+			Headers: buildHeaders(config.Headers, config.FetchMode),
 			Body:    bodyReader,
 		}
 
@@ -1653,14 +1759,16 @@ func httpcloak_request_async(handle C.int64_t, requestJSON *C.char, callbackID C
 			}
 		}
 
+		body, bodyEncoding := encodeResponseBody(bodyBytes)
 		data := ResponseData{
-			StatusCode: resp.StatusCode,
-			Headers:    resp.Headers,
-			Body:       string(bodyBytes),
-			FinalURL:   resp.FinalURL,
-			Protocol:   resp.Protocol,
-			Cookies:    cookies,
-			History:    history,
+			StatusCode:   resp.StatusCode,
+			Headers:      resp.Headers,
+			Body:         body,
+			BodyEncoding: bodyEncoding,
+			FinalURL:     resp.FinalURL,
+			Protocol:     resp.Protocol,
+			Cookies:      cookies,
+			History:      history,
 		}
 		jsonData, _ := json.Marshal(data)
 		invokeCallback(int64(callbackID), string(jsonData), "")
@@ -1968,7 +2076,7 @@ func httpcloak_free_string(str *C.char) {
 
 //export httpcloak_version
 func httpcloak_version() *C.char {
-	return C.CString("1.6.1")
+	return C.CString("1.6.5")
 }
 
 //export httpcloak_available_presets
@@ -2018,6 +2126,7 @@ var (
 	ErrInvalidSession    = errors.New("invalid session handle")
 	ErrInvalidStream     = errors.New("invalid stream handle")
 	ErrInvalidLocalProxy = errors.New("invalid local proxy handle")
+	ErrInvalidPresetPool = errors.New("invalid preset pool handle")
 )
 
 // ============================================================================
@@ -2842,7 +2951,7 @@ func httpcloak_stream_get(sessionHandle C.int64_t, url *C.char, optionsJSON *C.c
 	req := &httpcloak.Request{
 		Method:  "GET",
 		URL:     urlStr,
-		Headers: convertHeaders(options.Headers),
+		Headers: buildHeaders(options.Headers, options.FetchMode),
 	}
 
 	resp, err := session.DoStream(ctx, req)
@@ -2900,7 +3009,7 @@ func httpcloak_stream_post(sessionHandle C.int64_t, url *C.char, body *C.char, o
 	req := &httpcloak.Request{
 		Method:  "POST",
 		URL:     urlStr,
-		Headers: convertHeaders(options.Headers),
+		Headers: buildHeaders(options.Headers, options.FetchMode),
 		Body:    bodyReader,
 	}
 
@@ -2961,7 +3070,7 @@ func httpcloak_stream_request(sessionHandle C.int64_t, requestJSON *C.char) C.in
 	req := &httpcloak.Request{
 		Method:  config.Method,
 		URL:     config.URL,
-		Headers: convertHeaders(config.Headers),
+		Headers: buildHeaders(config.Headers, config.FetchMode),
 		Body:    bodyReader,
 	}
 
@@ -3274,13 +3383,15 @@ func httpcloak_upload_finish(uploadHandle C.int64_t) *C.char {
 
 	cookies := parseSetCookieHeaders(resp.Headers)
 
+	body, bodyEncoding := encodeResponseBody(bodyBytes)
 	responseData := ResponseData{
-		StatusCode: resp.StatusCode,
-		Headers:    resp.Headers,
-		Body:       string(bodyBytes),
-		FinalURL:   resp.FinalURL,
-		Protocol:   resp.Protocol,
-		Cookies:    cookies,
+		StatusCode:   resp.StatusCode,
+		Headers:      resp.Headers,
+		Body:         body,
+		BodyEncoding: bodyEncoding,
+		FinalURL:     resp.FinalURL,
+		Protocol:     resp.Protocol,
+		Cookies:      cookies,
 	}
 
 	jsonData, err := json.Marshal(responseData)
@@ -3412,6 +3523,158 @@ func encodeBase64(data []byte) string {
 	}
 
 	return string(result)
+}
+
+// --- Custom Preset Loading ---
+
+//export httpcloak_preset_load_file
+func httpcloak_preset_load_file(path *C.char) *C.char {
+	p, err := fingerprint.LoadAndBuildPreset(C.GoString(path))
+	if err != nil {
+		return makeErrorJSON(err)
+	}
+	if err := fingerprint.RegisterStrict(p.Name, p); err != nil {
+		return makeErrorJSON(err)
+	}
+	data, _ := json.Marshal(map[string]string{"name": p.Name})
+	return C.CString(string(data))
+}
+
+//export httpcloak_preset_load_json
+func httpcloak_preset_load_json(jsonData *C.char) *C.char {
+	p, err := fingerprint.LoadAndBuildPresetFromJSON([]byte(C.GoString(jsonData)))
+	if err != nil {
+		return makeErrorJSON(err)
+	}
+	if err := fingerprint.RegisterStrict(p.Name, p); err != nil {
+		return makeErrorJSON(err)
+	}
+	data, _ := json.Marshal(map[string]string{"name": p.Name})
+	return C.CString(string(data))
+}
+
+//export httpcloak_preset_unregister
+func httpcloak_preset_unregister(name *C.char) {
+	fingerprint.Unregister(C.GoString(name))
+}
+
+//export httpcloak_describe_preset
+// httpcloak_describe_preset returns a fully-resolved JSON dump of a preset's
+// effective state. The returned C string is malloc'd and must be freed by the
+// caller via httpcloak_free_string. On error (preset not registered, unknown
+// ClientHelloID), the result is a JSON object {"error": "..."} also requiring
+// httpcloak_free_string.
+func httpcloak_describe_preset(name *C.char) *C.char {
+	out, err := fingerprint.Describe(C.GoString(name))
+	if err != nil {
+		return makeErrorJSON(err)
+	}
+	return C.CString(out)
+}
+
+// --- Preset Pool Lifecycle ---
+
+//export httpcloak_pool_load_file
+func httpcloak_pool_load_file(path *C.char) *C.char {
+	pool, err := fingerprint.NewPresetPoolFromFile(C.GoString(path))
+	if err != nil {
+		return makeErrorJSON(err)
+	}
+	presetPoolMu.Lock()
+	presetPoolCounter++
+	handle := presetPoolCounter
+	presetPools[handle] = pool
+	presetPoolMu.Unlock()
+	data, _ := json.Marshal(map[string]int64{"handle": handle})
+	return C.CString(string(data))
+}
+
+//export httpcloak_pool_load_json
+func httpcloak_pool_load_json(jsonData *C.char) *C.char {
+	pool, err := fingerprint.NewPresetPoolFromJSON([]byte(C.GoString(jsonData)))
+	if err != nil {
+		return makeErrorJSON(err)
+	}
+	presetPoolMu.Lock()
+	presetPoolCounter++
+	handle := presetPoolCounter
+	presetPools[handle] = pool
+	presetPoolMu.Unlock()
+	data, _ := json.Marshal(map[string]int64{"handle": handle})
+	return C.CString(string(data))
+}
+
+// --- Preset Pool Accessors ---
+
+//export httpcloak_pool_pick
+func httpcloak_pool_pick(handle C.int64_t) *C.char {
+	pool := getPresetPool(handle)
+	if pool == nil {
+		return makeErrorJSON(ErrInvalidPresetPool)
+	}
+	return C.CString(pool.Pick().Name)
+}
+
+//export httpcloak_pool_random
+func httpcloak_pool_random(handle C.int64_t) *C.char {
+	pool := getPresetPool(handle)
+	if pool == nil {
+		return makeErrorJSON(ErrInvalidPresetPool)
+	}
+	return C.CString(pool.Random().Name)
+}
+
+//export httpcloak_pool_next
+func httpcloak_pool_next(handle C.int64_t) *C.char {
+	pool := getPresetPool(handle)
+	if pool == nil {
+		return makeErrorJSON(ErrInvalidPresetPool)
+	}
+	return C.CString(pool.Next().Name)
+}
+
+//export httpcloak_pool_get
+func httpcloak_pool_get(handle C.int64_t, index C.int64_t) *C.char {
+	pool := getPresetPool(handle)
+	if pool == nil {
+		return makeErrorJSON(ErrInvalidPresetPool)
+	}
+	idx := int(index)
+	if idx < 0 || idx >= pool.Size() {
+		return makeErrorJSON(fmt.Errorf("preset pool index %d out of range [0, %d)", idx, pool.Size()))
+	}
+	return C.CString(pool.Get(idx).Name)
+}
+
+//export httpcloak_pool_size
+func httpcloak_pool_size(handle C.int64_t) C.int64_t {
+	pool := getPresetPool(handle)
+	if pool == nil {
+		return -1
+	}
+	return C.int64_t(pool.Size())
+}
+
+//export httpcloak_pool_name
+func httpcloak_pool_name(handle C.int64_t) *C.char {
+	pool := getPresetPool(handle)
+	if pool == nil {
+		return makeErrorJSON(ErrInvalidPresetPool)
+	}
+	return C.CString(pool.Name())
+}
+
+//export httpcloak_pool_free
+func httpcloak_pool_free(handle C.int64_t) {
+	presetPoolMu.Lock()
+	pool, ok := presetPools[int64(handle)]
+	if ok {
+		delete(presetPools, int64(handle))
+	}
+	presetPoolMu.Unlock()
+	if pool != nil {
+		pool.Close()
+	}
 }
 
 func main() {}
