@@ -248,13 +248,23 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 	}
 
 	// Add cache validation headers (If-None-Match, If-Modified-Since)
-	// This makes requests look like a real browser that caches resources
-	if cached, exists := s.cacheEntries[req.URL]; exists {
-		if cached.etag != "" {
-			req.Headers["If-None-Match"] = []string{cached.etag}
-		}
-		if cached.lastModified != "" {
-			req.Headers["If-Modified-Since"] = []string{cached.lastModified}
+	// This makes requests look like a real browser that caches resources.
+	//
+	// Gated by method: browsers only revalidate cached responses for
+	// idempotent methods (GET/HEAD) per RFC 7234. Replaying ETag /
+	// Last-Modified on POST/PUT/DELETE/PATCH is a textbook anti-bot
+	// signal — Apple Shield (and likely others) edge-reject POSTs that
+	// carry If-None-Match. Confirmed empirically against
+	// /shop/pdpAddToBag in 2026-05-28 HAR diff: identical session, first
+	// POST 302 OK, second POST 412 with conditional headers attached.
+	if req.Method == "GET" || req.Method == "HEAD" {
+		if cached, exists := s.cacheEntries[req.URL]; exists {
+			if cached.etag != "" {
+				req.Headers["If-None-Match"] = []string{cached.etag}
+			}
+			if cached.lastModified != "" {
+				req.Headers["If-Modified-Since"] = []string{cached.lastModified}
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -383,8 +393,13 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 	// Parse Accept-CH header to store requested client hints for this host
 	s.parseAcceptCH(host, resp.Headers)
 
-	// Store cache validation headers from response for future requests
-	s.storeCacheHeaders(req.URL, resp.Headers)
+	// Store cache validation headers from response for future requests.
+	// Only for idempotent methods — see the symmetric gate above on the
+	// injection side (and RFC 7234 §4: caches MUST NOT satisfy a request
+	// with a stored response when the request method is non-idempotent).
+	if req.Method == "GET" || req.Method == "HEAD" {
+		s.storeCacheHeaders(req.URL, resp.Headers)
+	}
 
 	// Handle redirects
 	if isRedirectStatus(resp.StatusCode) {
