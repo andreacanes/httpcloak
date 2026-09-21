@@ -351,7 +351,13 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 	// Add cache validation headers (If-None-Match, If-Modified-Since) when
 	// the conditional cache is enabled session-wide AND the per-request flag
 	// hasn't opted out. Skipping here also means a fresh fetch on this URL.
-	if s.conditionalCacheEnabled && !req.DisableConditionalCache {
+	// Method gate: browsers only revalidate cached responses for GET/HEAD per
+	// RFC 7234. Replaying ETag / Last-Modified on POST/PUT/DELETE/PATCH is a
+	// textbook anti-bot signal — Apple Shield edge-rejects POSTs carrying
+	// If-None-Match: identical session, first /shop/pdpAddToBag POST 302, second
+	// 412 with conditional headers attached (2026-05-28 HAR diff).
+	if s.conditionalCacheEnabled && !req.DisableConditionalCache &&
+		(req.Method == "GET" || req.Method == "HEAD") {
 		if cached, exists := s.cacheEntries[req.URL]; exists {
 			if cached.etag != "" {
 				req.Headers["If-None-Match"] = []string{cached.etag}
@@ -512,7 +518,11 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 	// Store cache validation headers from response for future requests, unless
 	// the conditional cache is disabled session-wide or the caller asked to
 	// skip it for this request.
-	if s.conditionalCacheEnabled && !req.DisableConditionalCache {
+	// Symmetric partner of the injection-side method gate: RFC 7234 §4 — a cache
+	// MUST NOT satisfy a request with a stored response when the method is
+	// non-idempotent, so a POST response must not seed an entry either.
+	if s.conditionalCacheEnabled && !req.DisableConditionalCache &&
+		(req.Method == "GET" || req.Method == "HEAD") {
 		s.storeCacheHeaders(req.URL, resp.Headers)
 	}
 
