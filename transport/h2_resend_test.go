@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bufio"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	crand "crypto/rand"
@@ -35,6 +36,9 @@ type h2FaultServer struct {
 	// connections. This is the "requests that reached the socket" number.
 	headersSeen atomic.Int32
 	connsSeen   atomic.Int32
+	// h1RequestsSeen counts requests that arrived on a connection that
+	// negotiated HTTP/1.1.
+	h1RequestsSeen atomic.Int32
 
 	mu     sync.Mutex
 	orders [][]string
@@ -56,6 +60,9 @@ const (
 	// serving anything, which is the server declaring on the wire that it
 	// processed no stream on this connection.
 	h2FaultGoAwayUnprocessed
+	// h2FaultResetStream reads the request, then resets its stream with
+	// INTERNAL_ERROR, as an edge does to a login POST it refuses to serve.
+	h2FaultResetStream
 )
 
 func startH2FaultServer(t *testing.T, fault func(connIndex int32) h2Fault) *h2FaultServer {
@@ -89,7 +96,7 @@ func startH2FaultServer(t *testing.T, fault func(connIndex int32) h2Fault) *h2Fa
 	}
 	ln, err := stdtls.Listen("tcp", "127.0.0.1:0", &stdtls.Config{
 		Certificates: []stdtls.Certificate{cert},
-		NextProtos:   []string{"h2"},
+		NextProtos:   []string{"h2", "http/1.1"},
 		MinVersion:   stdtls.VersionTLS12,
 	})
 	if err != nil {
@@ -120,6 +127,10 @@ func (s *h2FaultServer) handleConn(c net.Conn) {
 		return
 	}
 	if err := tc.Handshake(); err != nil {
+		return
+	}
+	if tc.ConnectionState().NegotiatedProtocol != "h2" {
+		s.serveHTTP1(c)
 		return
 	}
 	preface := make([]byte, len(h2PrefaceStr))
@@ -163,6 +174,10 @@ func (s *h2FaultServer) handleConn(c net.Conn) {
 			s.orders = append(s.orders, order)
 			s.mu.Unlock()
 
+			if fault == h2FaultResetStream {
+				_ = fr.WriteRSTStream(f.StreamID, http2.ErrCodeInternal)
+				continue
+			}
 			if fault == h2FaultBreakAfterHeaders {
 				// The request is in. Drop the connection without answering:
 				// the client cannot tell processed from not-processed.
@@ -179,6 +194,22 @@ func (s *h2FaultServer) handleConn(c net.Conn) {
 			})
 		}
 	}
+}
+
+// serveHTTP1 answers one request on an HTTP/1.1 connection and counts it.
+func (s *h2FaultServer) serveHTTP1(c net.Conn) {
+	br := bufio.NewReader(c)
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	s.h1RequestsSeen.Add(1)
+	_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 }
 
 func h2FaultRequest(t *testing.T, tr *HTTP2Transport, preset *fingerprint.Preset, addr string) (*http.Response, error) {

@@ -1512,12 +1512,7 @@ func (t *Transport) Do(ctx context.Context, req *Request) (*Response, error) {
 				if err == nil {
 					return resp, nil
 				}
-				// Reuse TLS conn if proxy negotiated h1.1 instead of h2 (e.g. Charles, mitmproxy)
-				var alpnErr *ALPNMismatchError
-				if errors.As(err, &alpnErr) {
-					return t.doHTTP1WithTLSConn(ctx, req, alpnErr)
-				}
-				return t.doHTTP1(ctx, req)
+				return t.doHTTP1AfterHTTP2Failure(ctx, req, err)
 			}
 
 			if SupportsQUIC(udpEffectiveProxyURL) {
@@ -1542,12 +1537,7 @@ func (t *Transport) Do(ctx context.Context, req *Request) (*Response, error) {
 			if err == nil {
 				return resp, nil
 			}
-			// Reuse TLS conn if proxy negotiated h1.1 instead of h2 (e.g. Charles, mitmproxy)
-			var alpnErr *ALPNMismatchError
-			if errors.As(err, &alpnErr) {
-				return t.doHTTP1WithTLSConn(ctx, req, alpnErr)
-			}
-			return t.doHTTP1(ctx, req)
+			return t.doHTTP1AfterHTTP2Failure(ctx, req, err)
 
 		default:
 			if tcpBlocked != nil {
@@ -1594,17 +1584,7 @@ func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error)
 			if err == nil {
 				return resp, nil
 			}
-			// Check if ALPN mismatch - reuse connection for H1
-			var alpnErr *ALPNMismatchError
-			if errors.As(err, &alpnErr) {
-				return t.doHTTP1WithTLSConn(ctx, req, alpnErr)
-			}
-			// H2 failed for another reason: try H1 on a new connection, if
-			// that cannot send the request a second time.
-			if !canResendOnAnotherProtocol(req, err) {
-				return nil, err
-			}
-			return t.doHTTP1(ctx, req)
+			return t.doHTTP1AfterHTTP2Failure(ctx, req, err)
 		case ProtocolHTTP1:
 			return t.doHTTP1(ctx, req)
 		}
@@ -1701,6 +1681,21 @@ func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error)
 		return nil, err
 	}
 	return resp, nil
+}
+
+// doHTTP1AfterHTTP2Failure answers a request whose HTTP/2 attempt failed with
+// err. An ALPN mismatch is served on the connection that negotiated HTTP/1.1.
+// Any other failure goes to a new HTTP/1.1 connection only when that cannot
+// send the request a second time.
+func (t *Transport) doHTTP1AfterHTTP2Failure(ctx context.Context, req *Request, err error) (*Response, error) {
+	var alpnErr *ALPNMismatchError
+	if errors.As(err, &alpnErr) {
+		return t.doHTTP1WithTLSConn(ctx, req, alpnErr)
+	}
+	if !canResendOnAnotherProtocol(req, err) {
+		return nil, err
+	}
+	return t.doHTTP1(ctx, req)
 }
 
 // canResendOnAnotherProtocol reports whether a request whose attempt on one
